@@ -39,8 +39,8 @@ export default function LoginPage() {
   async function handleVerifyOTP(event: React.FormEvent) {
     event.preventDefault();
     setError(null);
-    if (!/^\d{6}$/.test(otpCode)) {
-      setError('Enter the six-digit code from your email.');
+    if (!/^\d{8}$/.test(otpCode)) {
+      setError('Enter the eight-digit code from your email.');
       return;
     }
 
@@ -110,10 +110,10 @@ export default function LoginPage() {
             ) : (
               <motion.div key="otp" initial={{ opacity: 0, x: 15 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -15 }}>
                 <h2 className="mb-2 text-2xl font-bold text-white">Check your email</h2>
-                <p className="mb-6 text-sm text-gray-400">Enter the six-digit code sent to <span className="font-medium text-white">{email}</span>. It expires shortly.</p>
+                <p className="mb-6 text-sm text-gray-400">Enter the eight-digit code sent to <span className="font-medium text-white">{email}</span>. It expires shortly.</p>
                 <form onSubmit={handleVerifyOTP} className="space-y-4">
                   <Field icon={KeyRound} label="Verification code">
-                    <input inputMode="numeric" autoComplete="one-time-code" value={otpCode} onChange={(event) => setOtpCode(event.target.value.replace(/\D/g, ''))} maxLength={6} pattern="\d{6}" placeholder="000000" required disabled={isPending} className="glass-input w-full rounded-xl py-3 pl-10 pr-3 text-center font-mono text-xl tracking-[0.35em]" />
+                    <input inputMode="numeric" autoComplete="one-time-code" value={otpCode} onChange={(event) => setOtpCode(event.target.value.replace(/\D/g, ''))} maxLength={8} pattern="\d{8}" placeholder="00000000" required disabled={isPending} className="glass-input w-full rounded-xl py-3 pl-10 pr-3 text-center font-mono text-xl tracking-[0.3em]" />
                   </Field>
                   <ErrorMessage error={error} />
                   <div className="flex gap-3">

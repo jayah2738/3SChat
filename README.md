@@ -8,7 +8,7 @@ There is no mock mode and no application data is stored in `localStorage`. Supab
 
 1. Create a Supabase project and run [`supabase.sql`](./supabase.sql) in its SQL editor. Re-run the file when upgrading an older 3SChat database; it is written as a migration and preserves existing rows.
 2. In **Authentication → Providers**, enable Email. Phone/SMS and Twilio are not required.
-3. In **Authentication → Email Templates → Magic Link**, make the message contain the six-digit token. For example:
+3. In **Authentication → Email Templates → Magic Link**, make the message contain the eight-digit token. For example:
 
    ```html
    <h2>Your 3SChat verification code</h2>
