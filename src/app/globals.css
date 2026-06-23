@@ -1,0 +1,142 @@
+@import "tailwindcss";
+
+:root {
+  --background: #05090b;
+  --foreground: #f8fafc;
+  
+  --primary-gradient: linear-gradient(135deg, #1e40af 0%, #b91c1c 100%);
+  --secondary-gradient: linear-gradient(135deg, #2563eb 0%, #ef4444 100%);
+  --glass-bg: rgba(17, 24, 39, 0.7);
+  --glass-border: rgba(255, 255, 255, 0.08);
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
+}
+
+body {
+  background-color: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  overflow-x: hidden;
+}
+
+.scrollbar-none {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+.scrollbar-none::-webkit-scrollbar {
+  display: none;
+}
+
+/* Premium Animated Gradient Background */
+.bg-animated-gradient {
+  background: linear-gradient(-45deg, #1e3a8a, #991b1b, #0f172a, #111827);
+  background-size: 400% 400%;
+  animation: gradientBG 15s ease infinite;
+}
+
+@keyframes gradientBG {
+  0% {
+    background-position: 0% 50%;
+  }
+  50% {
+    background-position: 100% 50%;
+  }
+  100% {
+    background-position: 0% 50%;
+  }
+}
+
+/* Glassmorphism Styles */
+.glass-container {
+  background: rgba(15, 23, 42, 0.45);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.glass-card {
+  background: rgba(30, 41, 59, 0.4);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.glass-input {
+  background: rgba(15, 23, 42, 0.6);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  color: #f8fafc;
+  transition: all 0.3s ease;
+}
+
+.glass-input:focus {
+  border-color: #3b82f6;
+  box-shadow: 0 0 10px rgba(59, 130, 246, 0.3);
+  outline: none;
+}
+
+/* Blue & Red Theme Gradients */
+.text-brand-gradient {
+  background: linear-gradient(135deg, #60a5fa 0%, #f87171 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+.bg-brand-gradient {
+  background: linear-gradient(135deg, #3b82f6 0%, #ef4444 100%);
+}
+
+.bg-brand-gradient-hover:hover {
+  background: linear-gradient(135deg, #2563eb 0%, #dc2626 100%);
+}
+
+.border-brand-gradient {
+  border-image: linear-gradient(135deg, #3b82f6, #ef4444) 1;
+}
+
+/* Custom Scrollbars */
+::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+
+::-webkit-scrollbar-track {
+  background: rgba(15, 23, 42, 0.2);
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+/* WhatsApp inspired chat background overlay */
+.chat-bg-pattern {
+  background-color: #0b141a;
+  background-image:
+    url("data:image/svg+xml,%3Csvg width='180' height='180' viewBox='0 0 180 180' xmlns='http://www.w3.org/2000/svg'%3E%3Cg fill='none' stroke='%23ffffff' stroke-opacity='.045' stroke-width='2'%3E%3Ccircle cx='26' cy='30' r='13'/%3E%3Cpath d='M21 30h10M26 25v10M76 22c16 2 24 17 14 29-10 12-31 4-30-12 1-10 7-16 16-17zM127 25h31v22h-31zM132 33h21M132 40h13M27 93c14-19 35-12 36 6 1 14-13 27-33 22-6-8-7-17-3-28zM99 89l18-18 18 18-18 18zM141 92c13 0 22 10 22 22s-9 22-22 22-22-10-22-22 9-22 22-22zM138 114h6M75 142c20-12 38-5 40 13M35 145h34M35 157h22'/%3E%3C/g%3E%3C/svg%3E"),
+    radial-gradient(rgba(59, 130, 246, 0.06) 1px, transparent 0),
+    radial-gradient(rgba(239, 68, 68, 0.045) 1px, transparent 0);
+  background-size: 180px 180px, 32px 32px, 32px 32px;
+  background-position: 0 0, 0 0, 16px 16px;
+}
+
+/* Message Bubbles styling */
+.bubble-incoming {
+  background: #1f2c33;
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  border-top-left-radius: 0;
+}
+
+.bubble-outgoing {
+  background: linear-gradient(135deg, rgba(29, 78, 216, 0.92) 0%, rgba(185, 28, 28, 0.92) 100%);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-top-right-radius: 0;
+}
