@@ -1,4 +1,5 @@
 'use client';
+/* eslint-disable @next/next/no-img-element -- private signed URLs and user-provided avatar URLs are dynamic */
 
 import React, { useState, useEffect, useRef } from 'react';
 import { useAuth } from '../../context/AuthContext';
@@ -7,7 +8,6 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { 
   Archive,
   BadgePlus,
-  Camera,
   CircleDashed,
   Image as ImageIcon,
   LockKeyhole,
@@ -31,17 +31,22 @@ import {
   Loader2,
   UsersRound,
   X,
-  Sparkles
+  Sparkles,
+  StopCircle,
+  Paperclip
 } from 'lucide-react';
 import { 
   supabase, 
-  IS_MOCK_MODE, 
-  mockDb, 
-  mockRealtime, 
   Profile, 
   Chat, 
-  Message 
+  Message,
+  MessageReaction,
+  MessageType,
 } from '../../lib/supabaseClient';
+
+const EMOJIS = ['😀', '😂', '😍', '👍', '❤️', '🔥', '🎉', '😮'];
+const REACTION_EMOJIS = ['👍', '❤️', '😂', '😮', '😢', '🔥'];
+const MAX_MEDIA_BYTES = 15 * 1024 * 1024;
 
 export default function ChatPage() {
   const { user, profile, logout, updateProfile, loading } = useAuth();
@@ -58,6 +63,11 @@ export default function ChatPage() {
   const [showSettings, setShowSettings] = useState(false);
   const [showNewChatModal, setShowNewChatModal] = useState(false);
   const [isUpdatingProfile, setIsUpdatingProfile] = useState(false);
+  const [showEmojiPicker, setShowEmojiPicker] = useState(false);
+  const [reactingTo, setReactingTo] = useState<string | null>(null);
+  const [isUploading, setIsUploading] = useState(false);
+  const [isRecording, setIsRecording] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
 
   // Input states
   const [inputText, setInputText] = useState('');
@@ -68,6 +78,11 @@ export default function ChatPage() {
   const [editAvatar, setEditAvatar] = useState('');
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const recordingChunksRef = useRef<Blob[]>([]);
+  const recordingStartedRef = useRef(0);
 
   // 1. Guard route: redirect if logged out
   useEffect(() => {
@@ -76,182 +91,137 @@ export default function ChatPage() {
     }
   }, [user, loading, router]);
 
-  // Initialize edit fields when profile loads
-  useEffect(() => {
-    if (profile) {
-      setEditName(profile.display_name || '');
-      setEditStatus(profile.status || '');
-      setEditAvatar(profile.avatar_url || '');
-    }
-  }, [profile]);
-
-  // 2. Fetch chats list and other profiles
-  const fetchChatsAndProfiles = async () => {
-    if (!user) return;
-    try {
-      if (IS_MOCK_MODE) {
-        const userChats = await mockDb.getChats(user.id);
-        setChats(userChats);
-
-        const otherProfiles = await mockDb.getAllProfiles(user.id);
-        setProfiles(otherProfiles);
-      } else {
-        // Real Supabase queries
-        // 1. Get user's chats
-        const { data: participantsData, error: cpError } = await supabase
-          .from('chat_participants')
-          .select('chat_id')
-          .eq('user_id', user.id);
-
-        if (cpError) throw cpError;
-
-        const chatIds = participantsData.map((cp: any) => cp.chat_id);
-
-        if (chatIds.length > 0) {
-          const { data: chatsData, error: chatsError } = await supabase
-            .from('chats')
-            .select('*, chat_participants(user_id, profiles(*))')
-            .in('id', chatIds);
-
-          if (chatsError) throw chatsError;
-
-          // Process chat data to resolve name & participants list
-          const formattedChats = chatsData.map((c: any) => {
-            const listParticipants = c.chat_participants
-              .filter((p: any) => p.user_id !== user.id)
-              .map((p: any) => p.profiles);
-            
-            const chatName = c.is_group 
-              ? c.name 
-              : (listParticipants[0]?.display_name || 'Direct Chat');
-
-            return {
-              id: c.id,
-              name: chatName,
-              is_group: c.is_group,
-              created_at: c.created_at,
-              participants: listParticipants
-            } as Chat;
-          });
-
-          setChats(formattedChats);
-        } else {
-          setChats([]);
-        }
-
-        // 2. Get other user profiles for new chat
-        const { data: allProfiles, error: profsError } = await supabase
-          .from('profiles')
-          .select('*')
-          .neq('id', user.id);
-
-        if (profsError) throw profsError;
-        setProfiles(allProfiles || []);
-      }
-    } catch (err) {
-      console.error('Error fetching chats/profiles:', err);
-    }
-  };
-
-  useEffect(() => {
-    if (user) {
-      fetchChatsAndProfiles();
-    }
-  }, [user]);
-
-  // 3. Fetch messages for active chat
-  const fetchMessages = async (chatId: string) => {
-    try {
-      if (IS_MOCK_MODE) {
-        const msgs = await mockDb.getMessages(chatId);
-        setMessages(msgs);
-      } else {
-        const { data, error } = await supabase
-          .from('messages')
-          .select('*')
-          .eq('chat_id', chatId)
-          .order('created_at', { ascending: true });
-
-        if (error) throw error;
-        setMessages(data || []);
-      }
-      scrollToBottom();
-    } catch (err) {
-      console.error('Error fetching messages:', err);
-    }
-  };
-
-  useEffect(() => {
-    if (activeChat) {
-      fetchMessages(activeChat.id);
-    } else {
-      setMessages([]);
-    }
-  }, [activeChat]);
-
-  useEffect(() => {
-    if (!activeChat && chats.length > 0) {
-      setActiveChat(chats[0]);
-    }
-  }, [activeChat, chats]);
-
-  // 4. Realtime subscriber for new messages
-  useEffect(() => {
-    if (!user) return;
-
-    let unsubscribeFunc: (() => void) | null = null;
-
-    const setupMessageListener = () => {
-      if (IS_MOCK_MODE) {
-        const sub = mockRealtime.subscribe('messages', user.id, (payload: Message) => {
-          // If message is for the active chat, add to messages list
-          if (activeChat && payload.chat_id === activeChat.id) {
-            setMessages((prev) => [...prev, payload]);
-            scrollToBottom();
-          }
-          // Refresh chat lists to update last message snippet
-          fetchChatsAndProfiles();
-        });
-        unsubscribeFunc = sub.unsubscribe;
-      } else {
-        const channel = supabase
-          .channel('global-messages')
-          .on(
-            'postgres_changes',
-            { event: 'INSERT', schema: 'public', table: 'messages' },
-            async (payload: any) => {
-              const newMsg = payload.new as Message;
-              
-              // Validate if user is participant of this chat before listing
-              // (Since RLS handles read restrictions, client updates might receive event but we check active chat ID)
-              if (activeChat && newMsg.chat_id === activeChat.id) {
-                setMessages((prev) => [...prev, newMsg]);
-                scrollToBottom();
-              }
-              fetchChatsAndProfiles();
-            }
-          )
-          .subscribe();
-
-        unsubscribeFunc = () => {
-          supabase.removeChannel(channel);
-        };
-      }
-    };
-
-    setupMessageListener();
-
-    return () => {
-      if (unsubscribeFunc) unsubscribeFunc();
-    };
-  }, [user, activeChat]);
-
-  // Scroll to bottom helper
   const scrollToBottom = () => {
     setTimeout(() => {
       messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
     }, 100);
   };
+
+  // 2. Fetch chats list and other profiles
+  const fetchChatsAndProfiles = async () => {
+    if (!user) return;
+    try {
+      const { data: participantsData, error: cpError } = await supabase
+        .from('chat_participants')
+        .select('chat_id')
+        .eq('user_id', user.id);
+      if (cpError) throw cpError;
+
+      const chatIds = (participantsData || []).map((participant) => participant.chat_id);
+      if (chatIds.length) {
+        const { data: chatsData, error: chatsError } = await supabase
+          .from('chats')
+          .select('*, chat_participants(user_id, profiles(*))')
+          .in('id', chatIds)
+          .order('updated_at', { ascending: false });
+        if (chatsError) throw chatsError;
+
+        const formattedChats = (chatsData || []).map((chat) => {
+          const rows = chat.chat_participants as unknown as Array<{ user_id: string; profiles: Profile | Profile[] }>;
+          const listParticipants = rows
+            .filter((participant) => participant.user_id !== user.id)
+            .flatMap((participant) => Array.isArray(participant.profiles) ? participant.profiles : [participant.profiles])
+            .filter(Boolean);
+          return {
+            id: chat.id,
+            name: chat.is_group ? (chat.name || 'Group') : (listParticipants[0]?.display_name || 'Direct chat'),
+            is_group: chat.is_group,
+            created_at: chat.created_at,
+            updated_at: chat.updated_at,
+            participants: listParticipants,
+          } as Chat;
+        });
+        setChats(formattedChats);
+      } else {
+        setChats([]);
+      }
+
+      const { data: allProfiles, error: profilesError } = await supabase
+        .from('profiles')
+        .select('id, phone_number, display_name, avatar_url, status, last_seen')
+        .neq('id', user.id)
+        .order('display_name');
+      if (profilesError) throw profilesError;
+      setProfiles((allProfiles || []) as Profile[]);
+    } catch (err) {
+      console.error('Error fetching chats/profiles:', err);
+      setActionError(err instanceof Error ? err.message : 'Unable to load conversations.');
+    }
+  };
+
+  useEffect(() => {
+    if (!user) return;
+    const timeout = setTimeout(() => void fetchChatsAndProfiles(), 0);
+    return () => clearTimeout(timeout);
+    // Fetchers intentionally use the latest authenticated user.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user]);
+
+  // 3. Fetch messages for active chat
+  const fetchMessages = async (chatId: string) => {
+    try {
+      const { error: readError } = await supabase.rpc('mark_chat_read', { target_chat_id: chatId });
+      if (readError) throw readError;
+      const { data, error } = await supabase
+        .from('messages')
+        .select('*, message_reactions(*)')
+        .eq('chat_id', chatId)
+        .order('created_at', { ascending: true });
+      if (error) throw error;
+
+      const hydrated = await Promise.all((data || []).map(async (row) => {
+        const message = { ...row, reactions: row.message_reactions || [] } as Message & { message_reactions?: MessageReaction[] };
+        if (message.media_path) {
+          const { data: signed } = await supabase.storage.from('chat-media').createSignedUrl(message.media_path, 3600);
+          message.media_url = signed?.signedUrl;
+        }
+        delete message.message_reactions;
+        return message;
+      }));
+      setMessages(hydrated);
+      scrollToBottom();
+    } catch (err) {
+      console.error('Error fetching messages:', err);
+      setActionError(err instanceof Error ? err.message : 'Unable to load messages.');
+    }
+  };
+
+  useEffect(() => {
+    const timeout = setTimeout(() => {
+      if (activeChat) void fetchMessages(activeChat.id);
+      else setMessages([]);
+    }, 0);
+    return () => clearTimeout(timeout);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeChat]);
+
+  useEffect(() => {
+    if (activeChat || !chats.length) return;
+    const timeout = setTimeout(() => setActiveChat(chats[0]), 0);
+    return () => clearTimeout(timeout);
+  }, [activeChat, chats]);
+
+  // 4. Realtime subscriber for new messages
+  useEffect(() => {
+    if (!user) return;
+    const channel = supabase
+      .channel(`chat-events-${user.id}`)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'messages' }, (payload) => {
+        const newMessage = payload.new as Message;
+        if (activeChat && newMessage.chat_id === activeChat.id) void fetchMessages(activeChat.id);
+        void fetchChatsAndProfiles();
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'message_reactions' }, () => {
+        if (activeChat) void fetchMessages(activeChat.id);
+      })
+      .subscribe();
+
+    return () => {
+      void supabase.removeChannel(channel);
+    };
+    // Re-subscribe only when the authenticated user or selected chat changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user, activeChat]);
 
   // 5. Send message action
   const handleSendMessage = async (e: React.FormEvent) => {
@@ -262,32 +232,19 @@ export default function ChatPage() {
     setInputText('');
 
     try {
-      if (IS_MOCK_MODE) {
-        const newMsg = await mockDb.sendMessage(activeChat.id, user.id, textToSend);
-        setMessages((prev) => [...prev, newMsg]);
-        scrollToBottom();
-        // Refresh chats to update snippets
-        fetchChatsAndProfiles();
-      } else {
-        const { data, error } = await supabase
-          .from('messages')
-          .insert({
-            chat_id: activeChat.id,
-            sender_id: user.id,
-            content: textToSend
-          })
-          .select()
-          .single();
-
-        if (error) throw error;
-        
-        // Optimistic update
-        setMessages((prev) => [...prev, data]);
-        scrollToBottom();
-        fetchChatsAndProfiles();
-      }
+      const { error } = await supabase.from('messages').insert({
+        chat_id: activeChat.id,
+        sender_id: user.id,
+        content: textToSend.trim(),
+        message_type: 'text',
+      });
+      if (error) throw error;
+      await fetchMessages(activeChat.id);
+      await fetchChatsAndProfiles();
     } catch (err) {
       console.error('Failed to send message:', err);
+      setInputText(textToSend);
+      setActionError(err instanceof Error ? err.message : 'Message could not be sent.');
     }
   };
 
@@ -296,68 +253,149 @@ export default function ChatPage() {
     if (!user) return;
 
     try {
-      if (IS_MOCK_MODE) {
-        const newChat = await mockDb.createChat(user.id, targetUser.id);
-        setActiveChat(newChat);
-        setShowNewChatModal(false);
-        setMobileView('chat');
-        fetchChatsAndProfiles();
-      } else {
-        // Real Supabase start chat
-        // Check if there is an existing direct chat
-        const { data: existingChats, error: queryError } = await supabase
-          .rpc('get_direct_chat_with_user', { target_user_id: targetUser.id });
-
-        if (!queryError && existingChats && existingChats.length > 0) {
-          const chatDetails: Chat = {
-            id: existingChats[0].chat_id,
-            name: targetUser.display_name,
-            is_group: false,
-            created_at: new Date().toISOString(),
-            participants: [targetUser]
-          };
-          setActiveChat(chatDetails);
-        } else {
-          // Create new chat
-          const { data: chatData, error: chatError } = await supabase
-            .from('chats')
-            .insert({ is_group: false })
-            .select()
-            .single();
-
-          if (chatError) throw chatError;
-
-          // Add participants
-          const participants = [
-            { chat_id: chatData.id, user_id: user.id },
-            { chat_id: chatData.id, user_id: targetUser.id }
-          ];
-
-          const { error: pError } = await supabase
-            .from('chat_participants')
-            .insert(participants);
-
-          if (pError) throw pError;
-
-          const newChatDetails: Chat = {
-            id: chatData.id,
-            name: targetUser.display_name,
-            is_group: false,
-            created_at: chatData.created_at,
-            participants: [targetUser]
-          };
-
-          setActiveChat(newChatDetails);
-        }
-
-        setShowNewChatModal(false);
-        setMobileView('chat');
-        fetchChatsAndProfiles();
-      }
+      const { data: chatId, error } = await supabase.rpc('create_direct_chat', { target_user_id: targetUser.id });
+      if (error || !chatId) throw error || new Error('The conversation could not be created.');
+      const chatDetails: Chat = {
+        id: chatId,
+        name: targetUser.display_name,
+        is_group: false,
+        created_at: new Date().toISOString(),
+        participants: [targetUser],
+      };
+      setActiveChat(chatDetails);
+      setShowNewChatModal(false);
+      setMobileView('chat');
+      await fetchChatsAndProfiles();
     } catch (err) {
       console.error('Failed to start chat:', err);
+      setActionError(err instanceof Error ? err.message : 'Conversation could not be started.');
     }
   };
+
+  const uploadMediaMessage = async (file: File, messageType: MessageType, durationSeconds?: number) => {
+    if (!activeChat || !user) return;
+    if (file.size > MAX_MEDIA_BYTES) throw new Error('Media must be smaller than 15 MB.');
+
+    setIsUploading(true);
+    setActionError(null);
+    const extension = (file.name.split('.').pop() || (messageType === 'voice' ? 'webm' : 'bin'))
+      .toLowerCase()
+      .replace(/[^a-z0-9]/g, '');
+    const path = `${activeChat.id}/${user.id}/${crypto.randomUUID()}.${extension}`;
+
+    try {
+      const { error: uploadError } = await supabase.storage
+        .from('chat-media')
+        .upload(path, file, { contentType: file.type, upsert: false });
+      if (uploadError) throw uploadError;
+
+      const { error: messageError } = await supabase.from('messages').insert({
+        chat_id: activeChat.id,
+        sender_id: user.id,
+        content: messageType === 'image' ? file.name : null,
+        message_type: messageType,
+        media_path: path,
+        media_mime_type: file.type,
+        media_size: file.size,
+        duration_seconds: durationSeconds || null,
+      });
+      if (messageError) {
+        await supabase.storage.from('chat-media').remove([path]);
+        throw messageError;
+      }
+
+      await fetchMessages(activeChat.id);
+      await fetchChatsAndProfiles();
+    } finally {
+      setIsUploading(false);
+    }
+  };
+
+  const handleFileSelected = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+    if (!file.type.startsWith('image/')) {
+      setActionError('Choose a JPEG, PNG, WebP, or GIF image.');
+      return;
+    }
+    try {
+      await uploadMediaMessage(file, 'image');
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : 'The image could not be sent.');
+    }
+  };
+
+  const stopRecording = () => {
+    if (mediaRecorderRef.current?.state === 'recording') mediaRecorderRef.current.stop();
+  };
+
+  const startRecording = async () => {
+    if (!activeChat || !user) return;
+    setActionError(null);
+    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') {
+      setActionError('Voice recording is not supported by this browser.');
+      return;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const preferredType = ['audio/webm;codecs=opus', 'audio/ogg;codecs=opus', 'audio/webm']
+        .find((type) => MediaRecorder.isTypeSupported(type));
+      const recorder = new MediaRecorder(stream, preferredType ? { mimeType: preferredType } : undefined);
+      mediaStreamRef.current = stream;
+      mediaRecorderRef.current = recorder;
+      recordingChunksRef.current = [];
+      recordingStartedRef.current = Date.now();
+
+      recorder.ondataavailable = (event) => {
+        if (event.data.size) recordingChunksRef.current.push(event.data);
+      };
+      recorder.onstop = async () => {
+        const mimeType = recorder.mimeType || 'audio/webm';
+        const extension = mimeType.includes('ogg') ? 'ogg' : mimeType.includes('mp4') ? 'm4a' : 'webm';
+        const blob = new Blob(recordingChunksRef.current, { type: mimeType });
+        const duration = Math.max(1, Math.round((Date.now() - recordingStartedRef.current) / 1000));
+        stream.getTracks().forEach((track) => track.stop());
+        mediaStreamRef.current = null;
+        mediaRecorderRef.current = null;
+        setIsRecording(false);
+        if (!blob.size) return;
+        try {
+          await uploadMediaMessage(new File([blob], `voice-${Date.now()}.${extension}`, { type: mimeType }), 'voice', duration);
+        } catch (error) {
+          setActionError(error instanceof Error ? error.message : 'The voice message could not be sent.');
+        }
+      };
+      recorder.start(250);
+      setIsRecording(true);
+    } catch (error) {
+      mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
+      setIsRecording(false);
+      setActionError(error instanceof Error ? error.message : 'Microphone permission was not granted.');
+    }
+  };
+
+  const toggleReaction = async (message: Message, emoji: string) => {
+    if (!user) return;
+    setReactingTo(null);
+    const exists = message.reactions?.some((reaction) => reaction.user_id === user.id && reaction.emoji === emoji);
+    const query = supabase.from('message_reactions');
+    const { error } = exists
+      ? await query.delete().eq('message_id', message.id).eq('user_id', user.id).eq('emoji', emoji)
+      : await query.insert({ message_id: message.id, user_id: user.id, emoji });
+    if (error) setActionError(error.message);
+    else if (activeChat) await fetchMessages(activeChat.id);
+  };
+
+  useEffect(() => () => {
+    if (mediaRecorderRef.current?.state === 'recording') {
+      mediaRecorderRef.current.ondataavailable = null;
+      mediaRecorderRef.current.onstop = null;
+      mediaRecorderRef.current.stop();
+    }
+    mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
+  }, []);
 
   // 7. Update profile action
   const handleUpdateProfile = async (e: React.FormEvent) => {
@@ -470,6 +508,14 @@ export default function ChatPage() {
               className="grid h-11 w-11 place-items-center rounded-full text-[#aebac1] transition hover:bg-[#2a302e] hover:text-white"
             >
               <Settings className="h-5 w-5" />
+            </button>
+            <button
+              type="button"
+              title="Sign out"
+              onClick={() => void logout()}
+              className="grid h-11 w-11 place-items-center rounded-full text-[#aebac1] transition hover:bg-red-500/10 hover:text-red-300"
+            >
+              <LogOut className="h-5 w-5" />
             </button>
             <button
               type="button"
@@ -629,28 +675,19 @@ export default function ChatPage() {
                         <h4 className="truncate text-base font-semibold leading-6 text-[#e9edef]">
                           {c.name}
                         </h4>
-                        <span className={`mt-1 shrink-0 text-xs ${!isActive && c.id === 'chat-demo-2' ? 'text-red-400' : 'text-[#aebac1]'}`}>
-                          {formatChatTime(c.created_at)}
+                        <span className="mt-1 shrink-0 text-xs text-[#aebac1]">
+                          {formatChatTime(c.updated_at || c.created_at)}
                         </span>
                       </div>
                       
                       <div className="mt-0.5 flex items-center justify-between gap-3">
                         <p className="flex min-w-0 items-center gap-1.5 truncate text-sm text-[#aebac1]">
-                          {c.id === 'chat-demo-2' ? (
-                            <Mic className="h-4 w-4 shrink-0 text-blue-400" />
-                          ) : (
-                            <CheckCheck className="h-4 w-4 shrink-0 text-gray-500" />
-                          )}
+                          <CheckCheck className="h-4 w-4 shrink-0 text-gray-500" />
                           <span className="truncate">
                             {targetProfile?.status || 'You pinned a message'}
                           </span>
                         </p>
                         
-                        {!isActive && c.id === 'chat-demo-2' && (
-                          <span className="grid h-5 min-w-5 shrink-0 place-items-center rounded-full bg-gradient-to-r from-blue-600 to-red-600 px-1.5 text-[11px] font-bold text-white">
-                            1
-                          </span>
-                        )}
                         {isActive && (
                           <Pin className="h-4 w-4 shrink-0 text-gray-500" />
                         )}
@@ -751,7 +788,7 @@ export default function ChatPage() {
               <div className="flex h-12 items-center gap-6 border-b border-black/30 bg-[#1f2725]/90 px-8 text-sm text-[#c8d0d4]">
                 <Pin className="h-4 w-4 shrink-0 text-[#aebac1]" />
                 <span className="truncate">
-                  {activeChat.participants?.[0]?.status || 'password twilio; @Haja262'}
+                  {activeChat.participants?.[0]?.status || 'Private conversation'}
                 </span>
               </div>
 
@@ -778,23 +815,66 @@ export default function ChatPage() {
                         className={`flex ${isOutgoing ? 'justify-end' : 'justify-start'}`}
                       >
                         <div
-                          className={`max-w-[78%] rounded-2xl px-4 py-2.5 shadow-md relative ${
+                          className={`group/message relative max-w-[78%] rounded-2xl px-4 py-2.5 shadow-md ${
                             isOutgoing 
                               ? 'bubble-outgoing text-white' 
                               : 'bubble-incoming text-gray-200'
                           }`}
                         >
-                          <p className="text-sm leading-relaxed whitespace-pre-wrap select-text break-words">
-                            {m.content}
-                          </p>
+                          {m.message_type === 'image' && m.media_url && (
+                            <a href={m.media_url} target="_blank" rel="noreferrer" className="mb-2 block overflow-hidden rounded-xl">
+                              <img src={m.media_url} alt={m.content || 'Shared image'} className="max-h-80 w-full object-contain" loading="lazy" />
+                            </a>
+                          )}
+                          {m.message_type === 'voice' && m.media_url && (
+                            <div className="mb-1 flex min-w-[220px] items-center gap-2">
+                              <Mic className="h-5 w-5 shrink-0 text-blue-300" />
+                              <audio controls preload="metadata" src={m.media_url} className="h-9 min-w-0 flex-1" />
+                              {m.duration_seconds && <span className="text-[10px] text-white/60">{m.duration_seconds}s</span>}
+                            </div>
+                          )}
+                          {m.content && m.message_type !== 'voice' && (
+                            <p className="whitespace-pre-wrap break-words text-sm leading-relaxed select-text">{m.content}</p>
+                          )}
+                          {m.message_type !== 'text' && !m.media_url && (
+                            <p className="text-xs text-amber-200">Media link expired. Refresh the conversation.</p>
+                          )}
                           <div className="flex items-center justify-end space-x-1 mt-1">
                             <span className="text-[9px] text-white/50 block select-none">
                               {messageTime}
                             </span>
                             {isOutgoing && (
-                              <CheckCheck className="w-3.5 h-3.5 text-blue-300 shrink-0" />
+                              <CheckCheck className={`h-3.5 w-3.5 shrink-0 ${m.is_read ? 'text-blue-300' : 'text-white/40'}`} />
                             )}
                           </div>
+                          <button
+                            type="button"
+                            onClick={() => setReactingTo((current) => current === m.id ? null : m.id)}
+                            title="React to message"
+                            className={`absolute -top-3 ${isOutgoing ? '-left-8' : '-right-8'} rounded-full bg-[#26302d] p-1.5 text-[#aebac1] opacity-0 shadow transition hover:text-white group-hover/message:opacity-100`}
+                          >
+                            <Smile className="h-4 w-4" />
+                          </button>
+                          {reactingTo === m.id && (
+                            <div className={`absolute -top-11 z-30 flex gap-1 rounded-full border border-white/10 bg-[#202624] p-1.5 shadow-xl ${isOutgoing ? 'right-0' : 'left-0'}`}>
+                              {REACTION_EMOJIS.map((emoji) => (
+                                <button key={emoji} type="button" onClick={() => void toggleReaction(m, emoji)} className="rounded-full p-1 text-lg transition hover:scale-125 hover:bg-white/10">{emoji}</button>
+                              ))}
+                            </div>
+                          )}
+                          {!!m.reactions?.length && (
+                            <div className={`absolute -bottom-4 flex gap-1 ${isOutgoing ? 'right-2' : 'left-2'}`}>
+                              {Array.from(new Set(m.reactions.map((reaction) => reaction.emoji))).map((emoji) => {
+                                const count = m.reactions?.filter((reaction) => reaction.emoji === emoji).length || 0;
+                                const mine = m.reactions?.some((reaction) => reaction.emoji === emoji && reaction.user_id === user.id);
+                                return (
+                                  <button key={emoji} type="button" onClick={() => void toggleReaction(m, emoji)} className={`rounded-full border px-1.5 py-0.5 text-xs shadow ${mine ? 'border-blue-400/60 bg-blue-500/20' : 'border-white/10 bg-[#202624]'}`}>
+                                    {emoji}{count > 1 ? ` ${count}` : ''}
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          )}
                         </div>
                       </motion.div>
                     );
@@ -804,44 +884,63 @@ export default function ChatPage() {
                 <div ref={messagesEndRef} />
               </div>
 
-              {/* Chat send textbar */}
-              <form 
-                onSubmit={handleSendMessage}
-                className="flex h-[62px] items-center gap-3 bg-[#1f2725] px-3"
-              >
+              {actionError && (
+                <div role="alert" className="flex items-center justify-between border-t border-red-500/20 bg-red-950/50 px-4 py-2 text-xs text-red-200">
+                  <span>{actionError}</span>
+                  <button type="button" onClick={() => setActionError(null)} aria-label="Dismiss error"><X className="h-4 w-4" /></button>
+                </div>
+              )}
+              {/* Chat composer */}
+              <form onSubmit={handleSendMessage} className="relative flex min-h-[62px] items-center gap-2 bg-[#1f2725] px-3 py-2">
+                <input ref={fileInputRef} type="file" accept="image/jpeg,image/png,image/webp,image/gif" onChange={handleFileSelected} className="hidden" />
                 <button
                   type="button"
-                  title="Add attachment"
+                  title="Send an image"
+                  onClick={() => fileInputRef.current?.click()}
+                  disabled={isUploading || isRecording}
                   className="rounded-full p-2.5 text-[#aebac1] transition hover:bg-[#2a302e] hover:text-white cursor-pointer"
                 >
-                  <Plus className="h-6 w-6" />
+                  {isUploading ? <Loader2 className="h-6 w-6 animate-spin" /> : <Paperclip className="h-6 w-6" />}
                 </button>
                 <button
                   type="button"
-                  title="Insert Emojis (Simulated)"
-                  onClick={() => setInputText((prev) => prev + ' :)')}
+                  title="Insert emoji"
+                  onClick={() => setShowEmojiPicker((visible) => !visible)}
+                  disabled={isRecording}
                   className="rounded-full p-2.5 text-[#aebac1] transition hover:bg-[#2a302e] hover:text-white cursor-pointer"
                 >
                   <Smile className="h-6 w-6" />
                 </button>
+                {showEmojiPicker && (
+                  <div className="absolute bottom-[58px] left-12 z-30 grid grid-cols-4 gap-1 rounded-2xl border border-white/10 bg-[#202624] p-2 shadow-2xl">
+                    {EMOJIS.map((emoji) => (
+                      <button key={emoji} type="button" onClick={() => { setInputText((text) => text + emoji); setShowEmojiPicker(false); }} className="rounded-lg p-2 text-xl hover:bg-white/10">{emoji}</button>
+                    ))}
+                  </div>
+                )}
                 
                 <input 
                   type="text"
-                  placeholder="Type a message"
+                  placeholder={isRecording ? 'Recording voice message…' : 'Type a message'}
                   value={inputText}
                   onChange={(e) => setInputText(e.target.value)}
+                  disabled={isRecording || isUploading}
+                  maxLength={5000}
                   className="min-w-0 flex-1 rounded-xl border border-transparent bg-[#2a302e] px-4 py-3 text-sm text-white placeholder:text-[#aebac1] focus:border-blue-500/50 focus:outline-none"
                 />
 
                 <button
-                  type="submit"
+                  type={inputText.trim() ? 'submit' : 'button'}
+                  onClick={inputText.trim() ? undefined : (isRecording ? stopRecording : () => void startRecording())}
+                  disabled={isUploading}
+                  title={inputText.trim() ? 'Send message' : isRecording ? 'Stop and send recording' : 'Record voice message'}
                   className={`rounded-full p-2.5 transition cursor-pointer ${
                     inputText.trim()
                       ? 'bg-brand-gradient text-white shadow-md shadow-blue-500/10 hover:opacity-95'
-                      : 'text-[#aebac1] hover:bg-[#2a302e] hover:text-white'
+                      : isRecording ? 'bg-red-500 text-white animate-pulse' : 'text-[#aebac1] hover:bg-[#2a302e] hover:text-white'
                   }`}
                 >
-                  {inputText.trim() ? <Send className="h-5 w-5" /> : <Mic className="h-6 w-6" />}
+                  {inputText.trim() ? <Send className="h-5 w-5" /> : isRecording ? <StopCircle className="h-6 w-6" /> : <Mic className="h-6 w-6" />}
                 </button>
               </form>
             </>
@@ -866,7 +965,7 @@ export default function ChatPage() {
                 <div className="grid grid-cols-2 gap-3 max-w-sm mx-auto pt-4 border-t border-white/5">
                   <div className="p-3 rounded-2xl glass-card text-left space-y-1">
                     <ShieldCheck className="w-5 h-5 text-blue-400" />
-                    <h4 className="text-xs font-bold text-white">Encrypted Schema</h4>
+                    <h4 className="text-xs font-bold text-white">Database protected</h4>
                     <p className="text-[10px] text-gray-500 leading-normal">
                       RLS checks verify user participant headers for every message request.
                     </p>
@@ -939,7 +1038,7 @@ export default function ChatPage() {
                       >
                         <div className="flex items-center space-x-3">
                           <img 
-                            src={p.avatar_url} 
+                            src={p.avatar_url || `https://api.dicebear.com/7.x/bottts/svg?seed=${encodeURIComponent(p.id)}`}
                             alt={p.display_name} 
                             className="w-9 h-9 rounded-xl bg-slate-800 object-cover"
                           />
