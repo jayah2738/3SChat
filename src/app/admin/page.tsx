@@ -47,8 +47,8 @@ export default function AdminPage() {
     setBusy(true);
     setError(null);
     const [usersResult, reportsResult, auditResult] = await Promise.all([
-      supabase.from('profiles').select('id, phone_number, display_name, avatar_url, status, last_seen, role, account_status, suspension_reason, suspended_at, created_at').order('created_at', { ascending: false }),
-      supabase.from('moderation_reports').select('id, reporter_id, reported_user_id, message_content, message_type, reason, status, review_note, created_at').order('created_at', { ascending: false }),
+      supabase.from('profiles').select('id, phone_number, display_name, avatar_url, status, last_seen, role, account_status, suspension_reason, suspended_at, created_at').order('created_at', { ascending: false }).limit(300),
+      supabase.from('moderation_reports').select('id, reporter_id, reported_user_id, message_content, message_type, reason, status, review_note, created_at').order('created_at', { ascending: false }).limit(200),
       supabase.from('admin_audit_logs').select('id, actor_id, target_user_id, action, details, created_at').order('created_at', { ascending: false }).limit(100),
     ]);
     const firstError = usersResult.error || reportsResult.error || auditResult.error;
@@ -74,7 +74,7 @@ export default function AdminPage() {
   const profilesById = useMemo(() => new Map(users.map((entry) => [entry.id, entry])), [users]);
   const visibleUsers = users.filter((entry) => {
     const query = search.toLowerCase();
-    return entry.display_name.toLowerCase().includes(query) || entry.phone_number.includes(search);
+    return entry.display_name.toLowerCase().includes(query) || entry.phone_number?.includes(search) || false;
   });
   const openReports = reports.filter((report) => report.status === 'open' || report.status === 'reviewing').length;
   const effectiveTab = profile?.role === 'moderator' ? 'reports' : tab;

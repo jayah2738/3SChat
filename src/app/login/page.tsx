@@ -6,7 +6,7 @@ import { AlertTriangle, KeyRound, Loader2, Mail, Phone, ShieldCheck, UserRound }
 import { useAuth } from '../../context/AuthContext';
 
 export default function LoginPage() {
-  const { sendOTP, verifyOTP, sessionKickout, resetKickout, loading, user } = useAuth();
+  const { signInWithGoogle, sendOTP, verifyOTP, sessionKickout, resetKickout, loading, user } = useAuth();
   const [phoneNumber, setPhoneNumber] = useState('');
   const [email, setEmail] = useState('');
   const [displayName, setDisplayName] = useState('');
@@ -34,6 +34,17 @@ export default function LoginPage() {
     setIsPending(false);
     if (result.success) setStep('otp');
     else setError(result.error || 'The email code could not be sent.');
+  }
+
+  async function handleGoogleLogin() {
+    setError(null);
+    resetKickout();
+    setIsPending(true);
+    const result = await signInWithGoogle();
+    if (!result.success) {
+      setIsPending(false);
+      setError(result.error || 'Google sign-in could not be started.');
+    }
   }
 
   async function handleVerifyOTP(event: React.FormEvent) {
@@ -90,7 +101,14 @@ export default function LoginPage() {
             {step === 'identity' ? (
               <motion.div key="identity" initial={{ opacity: 0, x: -15 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: 15 }}>
                 <h2 className="mb-2 text-2xl font-bold text-white">Sign in securely</h2>
-                <p className="mb-6 text-sm leading-relaxed text-gray-400">Your phone number identifies your account. The verification code is delivered to your email—no Twilio or SMS.</p>
+                <p className="mb-5 text-sm leading-relaxed text-gray-400">Google is the recommended free sign-in method. You can still use your phone number with an email verification code.</p>
+                <button type="button" onClick={() => void handleGoogleLogin()} disabled={isPending} className="relative flex w-full items-center justify-center gap-3 rounded-xl border border-white/15 bg-white py-3 font-semibold text-gray-900 transition hover:bg-gray-100 disabled:opacity-60">
+                  <GoogleIcon />
+                  {isPending ? 'Connecting to Google…' : 'Continue with Google'}
+                  <span className="absolute right-3 hidden rounded-full bg-emerald-100 px-2 py-0.5 text-[9px] font-bold uppercase tracking-wide text-emerald-700 sm:inline">Recommended</span>
+                </button>
+                <ErrorMessage error={error} />
+                <div className="my-5 flex items-center gap-3 text-[10px] font-semibold uppercase tracking-widest text-gray-500"><span className="h-px flex-1 bg-white/10" /><span>or use email OTP</span><span className="h-px flex-1 bg-white/10" /></div>
                 <form onSubmit={handleSendOTP} className="space-y-4">
                   <Field icon={Phone} label="Phone number">
                     <input type="tel" autoComplete="tel" value={phoneNumber} onChange={(event) => setPhoneNumber(event.target.value)} placeholder="+254 700 000 000" required disabled={isPending} className="glass-input w-full rounded-xl py-3 pl-10 pr-3" />
@@ -101,7 +119,6 @@ export default function LoginPage() {
                   <Field icon={UserRound} label="Display name (new accounts)">
                     <input type="text" autoComplete="name" value={displayName} onChange={(event) => setDisplayName(event.target.value)} placeholder="How people see you" maxLength={60} disabled={isPending} className="glass-input w-full rounded-xl py-3 pl-10 pr-3" />
                   </Field>
-                  <ErrorMessage error={error} />
                   <button disabled={isPending} className="flex w-full items-center justify-center gap-2 rounded-xl bg-brand-gradient py-3 font-semibold text-white transition hover:opacity-95 disabled:opacity-60">
                     {isPending ? <Loader2 className="h-5 w-5 animate-spin" /> : <><Mail className="h-4 w-4" /> Email my code</>}
                   </button>
@@ -128,9 +145,20 @@ export default function LoginPage() {
           </AnimatePresence>
         </section>
 
-        <p className="mt-6 flex items-center justify-center gap-2 text-xs text-gray-500"><ShieldCheck className="h-4 w-4 text-emerald-500" /> Email OTP · database session lock · row-level security</p>
+        <p className="mt-6 flex items-center justify-center gap-2 text-xs text-gray-500"><ShieldCheck className="h-4 w-4 text-emerald-500" /> Google or email OTP · database session lock · row-level security</p>
       </div>
     </main>
+  );
+}
+
+function GoogleIcon() {
+  return (
+    <svg aria-hidden="true" viewBox="0 0 24 24" className="h-5 w-5 shrink-0">
+      <path fill="#4285F4" d="M21.6 12.23c0-.71-.06-1.4-.18-2.07H12v3.92h5.38a4.6 4.6 0 0 1-2 3.02v2.55h3.24c1.9-1.75 2.98-4.33 2.98-7.42Z" />
+      <path fill="#34A853" d="M12 22c2.7 0 4.98-.9 6.63-2.35l-3.24-2.55c-.9.6-2.05.96-3.39.96-2.61 0-4.82-1.76-5.61-4.13H3.04v2.63A10 10 0 0 0 12 22Z" />
+      <path fill="#FBBC05" d="M6.39 13.93A6.01 6.01 0 0 1 6.08 12c0-.67.12-1.32.31-1.93V7.44H3.04A10 10 0 0 0 2 12c0 1.61.39 3.14 1.04 4.56l3.35-2.63Z" />
+      <path fill="#EA4335" d="M12 5.94c1.47 0 2.79.51 3.83 1.5l2.87-2.87A9.63 9.63 0 0 0 12 2a10 10 0 0 0-8.96 5.44l3.35 2.63C7.18 7.7 9.39 5.94 12 5.94Z" />
+    </svg>
   );
 }
 

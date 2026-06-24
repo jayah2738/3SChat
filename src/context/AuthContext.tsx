@@ -16,11 +16,36 @@ interface AuthResult {
   error?: string;
 }
 
+const OAUTH_PENDING_KEY = '3schat-google-oauth-pending';
+
+type AuthDeliveryError = {
+  message?: string;
+  code?: string;
+  status?: number;
+  name?: string;
+};
+
+function emailDeliveryError(error: AuthDeliveryError): string {
+  const message = error.message?.trim() || '';
+  const normalized = message.toLowerCase();
+
+  if (error.status === 429 || normalized.includes('rate limit') || normalized.includes('too many')) {
+    return 'Too many verification emails were requested. Wait a few minutes before trying again.';
+  }
+
+  if (normalized.includes('error sending confirmation email') || normalized.includes('sending email')) {
+    return 'Supabase could not deliver the verification email. Its test mailer only sends to project team addresses. Configure custom SMTP in Supabase Authentication settings, then try again.';
+  }
+
+  return message || 'Unable to send the verification email.';
+}
+
 interface AuthContextType {
   user: User | null;
   profile: Profile | null;
   loading: boolean;
   sessionKickout: boolean;
+  signInWithGoogle: () => Promise<AuthResult>;
   sendOTP: (phoneNumber: string, email: string, displayName: string) => Promise<AuthResult>;
   verifyOTP: (phoneNumber: string, email: string, code: string) => Promise<AuthResult>;
   logout: () => Promise<void>;
@@ -60,25 +85,52 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     let alive = true;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
 
-    async function restoreSession() {
+    const scheduleRetry = (attempt: number) => {
+      if (!alive || attempt >= 3) return;
+      if (retryTimer) clearTimeout(retryTimer);
+      retryTimer = setTimeout(() => void restoreSession(attempt + 1), 1500 * (attempt + 1));
+    };
+
+    async function restoreSession(attempt = 0) {
       try {
         const { data: { session }, error } = await supabase.auth.getSession();
         if (error) throw error;
         if (!session) return;
 
+        if (sessionStorage.getItem(OAUTH_PENDING_KEY) === '1') {
+          const { error: activationError } = await supabase.rpc('activate_session');
+          if (activationError) throw activationError;
+          sessionStorage.removeItem(OAUTH_PENDING_KEY);
+          setSessionKickout(false);
+        }
+
         const { data: isActive, error: activeError } = await supabase.rpc('is_active_session');
-        if (activeError || !isActive) {
+        if (activeError) {
+          // Keep the persisted token during temporary network/migration failures.
+          // A later retry can validate it without forcing another email OTP.
+          console.warn('Session validation is temporarily unavailable:', activeError.message);
+          if (alive) setUser(session.user);
+          scheduleRetry(attempt);
+          return;
+        }
+        if (!isActive) {
           await clearLocalAuth(true);
           return;
         }
 
         if (!alive) return;
         setUser(session.user);
-        await loadProfile(session.user.id);
+        try {
+          await loadProfile(session.user.id);
+        } catch (profileError) {
+          console.warn('Profile restoration will be retried:', profileError);
+          scheduleRetry(attempt);
+        }
       } catch (error) {
         console.error('Unable to restore the authenticated session:', error);
-        await clearLocalAuth(false);
+        scheduleRetry(attempt);
       } finally {
         if (alive) setLoading(false);
       }
@@ -97,6 +149,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
     return () => {
       alive = false;
+      if (retryTimer) clearTimeout(retryTimer);
       subscription.unsubscribe();
     };
   }, [clearLocalAuth, loadProfile]);
@@ -133,6 +186,26 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     };
   }, [clearLocalAuth, user]);
 
+  const signInWithGoogle = async (): Promise<AuthResult> => {
+    try {
+      sessionStorage.setItem(OAUTH_PENDING_KEY, '1');
+      const { error } = await supabase.auth.signInWithOAuth({
+        provider: 'google',
+        options: {
+          redirectTo: `${window.location.origin}/login`,
+        },
+      });
+      if (error) {
+        sessionStorage.removeItem(OAUTH_PENDING_KEY);
+        return { success: false, error: error.message };
+      }
+      return { success: true };
+    } catch (error) {
+      sessionStorage.removeItem(OAUTH_PENDING_KEY);
+      return { success: false, error: error instanceof Error ? error.message : 'Google sign-in could not be started.' };
+    }
+  };
+
   const sendOTP = async (phoneNumber: string, email: string, displayName: string): Promise<AuthResult> => {
     try {
       const phone = normalizePhone(phoneNumber);
@@ -147,9 +220,21 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         },
       });
 
-      return error ? { success: false, error: error.message } : { success: true };
+      if (error) {
+        const deliveryError = error as AuthDeliveryError;
+        console.error('Supabase OTP delivery failed:', {
+          message: deliveryError.message,
+          code: deliveryError.code,
+          status: deliveryError.status,
+          name: deliveryError.name,
+        });
+        return { success: false, error: emailDeliveryError(deliveryError) };
+      }
+      return { success: true };
     } catch (error) {
-      return { success: false, error: error instanceof Error ? error.message : 'Unable to send the email code.' };
+      const deliveryError = error as AuthDeliveryError;
+      console.error('Unexpected OTP delivery failure:', error);
+      return { success: false, error: emailDeliveryError(deliveryError) };
     }
   };
 
@@ -183,7 +268,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         return { success: false, error: profileError?.message || 'Your profile could not be loaded.' };
       }
 
-      if (normalizePhone(accountProfile.phone_number) !== phone) {
+      if (!accountProfile.phone_number || normalizePhone(accountProfile.phone_number) !== phone) {
         await supabase.rpc('release_session');
         await supabase.auth.signOut({ scope: 'local' });
         return { success: false, error: 'That phone number is not associated with this email account.' };
@@ -248,6 +333,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       profile,
       loading,
       sessionKickout,
+      signInWithGoogle,
       sendOTP,
       verifyOTP,
       logout,

@@ -47,10 +47,12 @@ import { useWebRtcCall } from '../../hooks/useWebRtcCall';
 import { pendingMessages, queueMessage, removePendingMessage } from '../../lib/offlineQueue';
 import { decryptMessage, encryptMessage } from '../../lib/e2ee';
 import { filterChats, unreadTotal, type ChatFilterValue } from '../../lib/chatUtils';
+import { compressImageForUpload, IMAGE_MAX_BYTES, validateUploadSize, VOICE_MAX_BYTES } from '../../lib/media';
 import { 
   supabase, 
   Profile, 
   Chat, 
+  ChatSummary,
   Message,
   MessageReaction,
   MessageReceipt,
@@ -59,7 +61,9 @@ import {
 } from '../../lib/supabaseClient';
 
 const EMOJIS = ['😀', '😂', '😍', '👍', '❤️', '🔥', '🎉', '😮'];
-const MAX_MEDIA_BYTES = 15 * 1024 * 1024;
+const MESSAGE_PAGE_SIZE = 30;
+const TYPING_BROADCAST_INTERVAL_MS = 2500;
+const MESSAGE_SELECT = 'id, chat_id, sender_id, content, message_type, media_path, media_mime_type, media_size, duration_seconds, is_read, created_at, updated_at, edited_at, deleted_at, encrypted_content, encryption_iv, encryption_version, message_reactions(message_id, user_id, emoji, created_at), message_receipts(message_id, user_id, delivered_at, read_at)';
 
 export default function ChatPage() {
   const { user, profile, logout, updateProfile, changeEmail, changePhone, loading } = useAuth();
@@ -71,6 +75,10 @@ export default function ChatPage() {
   const [activeChat, setActiveChat] = useState<Chat | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [profiles, setProfiles] = useState<Profile[]>([]);
+  const [chatsLoading, setChatsLoading] = useState(true);
+  const [messagesLoading, setMessagesLoading] = useState(false);
+  const [olderMessagesLoading, setOlderMessagesLoading] = useState(false);
+  const [hasOlderMessages, setHasOlderMessages] = useState(false);
   
   // UI toggles
   const [mobileView, setMobileView] = useState<'list' | 'chat'>('list');
@@ -106,15 +114,31 @@ export default function ChatPage() {
   const [editPhone, setEditPhone] = useState('');
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const messagesViewportRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const recordingChunksRef = useRef<Blob[]>([]);
   const recordingStartedRef = useRef(0);
+  const recordingLimitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const longPressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const typingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const chatRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastTypingBroadcastRef = useRef(0);
+  const typingActiveRef = useRef(false);
+  const loadedMessageIdsRef = useRef<Set<string>>(new Set());
+  const previousMessageScrollTopRef = useRef(0);
+  const lastSeenTouchRef = useRef(0);
   const realtimeChannelRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
   const activeChatId = activeChat?.id;
+  const activeChatIdRef = useRef<string | undefined>(activeChatId);
+
+  useEffect(() => { activeChatIdRef.current = activeChatId; }, [activeChatId]);
+
+  const scheduleChatListRefresh = () => {
+    if (chatRefreshTimerRef.current) clearTimeout(chatRefreshTimerRef.current);
+    chatRefreshTimerRef.current = setTimeout(() => void fetchChatsAndProfiles(), 500);
+  };
 
   // 1. Guard route: redirect if logged out
   useEffect(() => {
@@ -139,7 +163,19 @@ export default function ChatPage() {
     if (queued.length) setActionError('Queued messages were sent.');
   };
 
-  // 2. Fetch chats list and other profiles
+  const fetchProfiles = async () => {
+    if (!user) return;
+    const { data, error } = await supabase
+      .from('profiles')
+      .select('id, phone_number, display_name, avatar_url, status, last_seen, role, account_status')
+      .neq('id', user.id)
+      .eq('account_status', 'active')
+      .order('display_name');
+    if (error) throw error;
+    setProfiles((data || []) as Profile[]);
+  };
+
+  // 2. Fetch compact chat-list data. Message bodies are paginated separately.
   const fetchChatsAndProfiles = async () => {
     if (!user) return;
     try {
@@ -151,43 +187,25 @@ export default function ChatPage() {
 
       const chatIds = (participantsData || []).map((participant) => participant.chat_id);
       if (chatIds.length) {
-        const [{ data: chatsData, error: chatsError }, { data: messageData, error: messageError }, { data: blockedData, error: blockedError }, { data: receiptData, error: receiptError }] = await Promise.all([
+        const [{ data: chatsData, error: chatsError }, { data: summaryData, error: summaryError }, { data: blockedData, error: blockedError }] = await Promise.all([
           supabase
             .from('chats')
-            .select('*, chat_participants(user_id, profiles(*))')
+            .select('id, name, is_group, created_at, updated_at, encryption_enabled, encryption_salt, chat_participants(user_id, profiles(id, phone_number, display_name, avatar_url, status, last_seen, role, account_status))')
             .in('id', chatIds)
             .order('updated_at', { ascending: false }),
-          supabase
-            .from('messages')
-            .select('id, chat_id, sender_id, content, encrypted_content, message_type, is_read, created_at, deleted_at')
-            .in('chat_id', chatIds)
-            .order('created_at', { ascending: false }),
+          supabase.rpc('get_chat_summaries'),
           supabase
             .from('blocked_users')
             .select('blocked_id')
             .eq('blocker_id', user.id),
-          supabase
-            .from('message_receipts')
-            .select('message_id')
-            .eq('user_id', user.id)
-            .not('read_at', 'is', null),
         ]);
         if (chatsError) throw chatsError;
-        if (messageError) throw messageError;
+        if (summaryError) throw summaryError;
         if (blockedError) throw blockedError;
-        if (receiptError) throw receiptError;
 
         const preferences = new Map((participantsData || []).map((participant) => [participant.chat_id, participant]));
-        const latestByChat = new Map<string, NonNullable<typeof messageData>[number]>();
-        const unreadByChat = new Map<string, number>();
+        const summaries = new Map(((summaryData || []) as ChatSummary[]).map((summary) => [summary.chat_id, summary]));
         const blockedIds = new Set((blockedData || []).map((block) => block.blocked_id));
-        const readMessageIds = new Set((receiptData || []).map((receipt) => receipt.message_id));
-        for (const message of messageData || []) {
-          if (!latestByChat.has(message.chat_id)) latestByChat.set(message.chat_id, message);
-          if (message.sender_id !== user.id && !readMessageIds.has(message.id)) {
-            unreadByChat.set(message.chat_id, (unreadByChat.get(message.chat_id) || 0) + 1);
-          }
-        }
 
         const formattedChats = (chatsData || []).map((chat) => {
           const rows = chat.chat_participants as unknown as Array<{ user_id: string; profiles: Profile | Profile[] }>;
@@ -198,14 +216,14 @@ export default function ChatPage() {
             .filter(Boolean);
           if (isSelf && profile) listParticipants.push(profile);
           const preference = preferences.get(chat.id);
-          const latest = latestByChat.get(chat.id);
-          const preview = latest?.deleted_at
+          const summary = summaries.get(chat.id);
+          const preview = summary?.last_message_deleted_at
             ? 'Message deleted'
-            : latest?.message_type === 'image'
+            : summary?.last_message_type === 'image'
               ? '📷 Image'
-              : latest?.message_type === 'voice'
+              : summary?.last_message_type === 'voice'
                 ? '🎙 Voice message'
-                : latest?.encrypted_content ? '🔒 Encrypted message' : latest?.content;
+                : summary?.last_message_encrypted ? '🔒 Encrypted message' : summary?.last_message_content;
           return {
             id: chat.id,
             name: isSelf ? `${profile?.display_name || 'Me'} (You)` : chat.is_group ? (chat.name || 'Group') : (listParticipants[0]?.display_name || 'Direct chat'),
@@ -220,7 +238,7 @@ export default function ChatPage() {
             member_role: preference?.member_role || 'member',
             encryption_enabled: chat.encryption_enabled || false,
             encryption_salt: chat.encryption_salt,
-            unread_count: unreadByChat.get(chat.id) || 0,
+            unread_count: Number(summary?.unread_count || 0),
             last_message: preview || null,
             is_blocked: !isSelf && !!listParticipants[0] && blockedIds.has(listParticipants[0].id),
           } as Chat;
@@ -231,23 +249,20 @@ export default function ChatPage() {
         setChats([]);
       }
 
-      const { data: allProfiles, error: profilesError } = await supabase
-        .from('profiles')
-        .select('id, phone_number, display_name, avatar_url, status, last_seen, role, account_status')
-        .neq('id', user.id)
-        .order('display_name');
-      if (profilesError) throw profilesError;
-      setProfiles((allProfiles || []) as Profile[]);
     } catch (err) {
       const message = databaseErrorMessage(err, 'Unable to load conversations.');
       console.error('Error fetching chats/profiles:', message, err);
       setActionError(message);
+    } finally {
+      setChatsLoading(false);
     }
   };
 
   useEffect(() => {
     if (!user) return;
-    const timeout = setTimeout(() => void fetchChatsAndProfiles(), 0);
+    const timeout = setTimeout(() => void Promise.all([fetchChatsAndProfiles(), fetchProfiles()]).catch((error) => {
+      setActionError(databaseErrorMessage(error, 'Unable to load contacts.'));
+    }), 0);
     return () => clearTimeout(timeout);
     // Fetchers intentionally use the latest authenticated user.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -262,17 +277,84 @@ export default function ChatPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user]);
 
-  // 3. Fetch messages for active chat
-  const fetchMessages = async (chatId: string) => {
+  useEffect(() => {
+    if (!user) return;
+    const touchLastSeen = () => {
+      const now = Date.now();
+      if (now - lastSeenTouchRef.current < 60_000) return;
+      lastSeenTouchRef.current = now;
+      void supabase.from('profiles').update({ last_seen: new Date(now).toISOString() }).eq('id', user.id);
+    };
+    const onVisibilityChange = () => touchLastSeen();
+    touchLastSeen();
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => document.removeEventListener('visibilitychange', onVisibilityChange);
+  }, [user]);
+
+  const hydrateMessages = async (rows: Array<Record<string, unknown>>, chatId: string, pinnedIds: Set<string>) => {
+    const mediaPaths = Array.from(new Set(rows
+      .map((row) => row.media_path)
+      .filter((path): path is string => typeof path === 'string' && !!path)));
+    const signedUrls = new Map<string, string>();
+    if (mediaPaths.length) {
+      const { data: signedData } = await supabase.storage.from('chat-media').createSignedUrls(mediaPaths, 3600);
+      for (const signed of signedData || []) {
+        if (signed.path && signed.signedUrl) signedUrls.set(signed.path, signed.signedUrl);
+      }
+    }
+
+    return Promise.all(rows.map(async (row) => {
+      const reactions = (row.message_reactions || []) as MessageReaction[];
+      const receipts = (row.message_receipts || []) as MessageReceipt[];
+      const message = {
+        ...row,
+        reactions,
+        receipts,
+        is_pinned: pinnedIds.has(row.id as string),
+      } as unknown as Message;
+      if (message.media_path && !message.deleted_at) message.media_url = signedUrls.get(message.media_path);
+      if (message.encrypted_content && message.encryption_iv) {
+        const secret = chatSecrets.get(chatId);
+        const chat = chats.find((entry) => entry.id === chatId);
+        if (secret && chat?.encryption_salt) {
+          try { message.content = await decryptMessage(message.encrypted_content, message.encryption_iv, secret, chat.encryption_salt); }
+          catch { message.content = null; message.decryption_failed = true; }
+        } else {
+          message.content = null;
+          message.decryption_failed = true;
+        }
+      }
+      return message;
+    }));
+  };
+
+  // 3. Load only the newest page, then prepend older pages on demand.
+  const fetchMessages = async (chatId: string, mode: 'initial' | 'refresh' | 'older' = 'refresh') => {
+    if (mode === 'older' && (olderMessagesLoading || !hasOlderMessages)) return;
+    const viewport = messagesViewportRef.current;
+    const previousScrollHeight = viewport?.scrollHeight || 0;
+    if (mode === 'initial') setMessagesLoading(true);
+    if (mode === 'older') setOlderMessagesLoading(true);
     try {
-      const { error: readError } = await supabase.rpc('mark_chat_read', { target_chat_id: chatId });
-      if (readError) throw readError;
+      if (mode !== 'older') {
+        const { error: readError } = await supabase.rpc('mark_chat_read', { target_chat_id: chatId });
+        if (readError) throw readError;
+      }
+
+      let messageQuery = supabase
+        .from('messages')
+        .select(MESSAGE_SELECT)
+        .eq('chat_id', chatId)
+        .order('created_at', { ascending: false })
+        .order('id', { ascending: false })
+        .limit(MESSAGE_PAGE_SIZE);
+      if (mode === 'older' && messages[0]?.created_at) {
+        const cursor = messages[0];
+        messageQuery = messageQuery.or(`created_at.lt.${cursor.created_at},and(created_at.eq.${cursor.created_at},id.lt.${cursor.id})`);
+      }
+
       const [{ data, error }, { data: pinData, error: pinError }] = await Promise.all([
-        supabase
-          .from('messages')
-          .select('*, message_reactions(*), message_receipts(*)')
-          .eq('chat_id', chatId)
-          .order('created_at', { ascending: true }),
+        messageQuery,
         supabase
           .from('message_pins')
           .select('message_id, pinned_at')
@@ -281,42 +363,39 @@ export default function ChatPage() {
       ]);
       if (error) throw error;
       if (pinError) throw pinError;
+      if (activeChatIdRef.current !== chatId) return;
       const pinnedIds = new Set((pinData || []).map((pin) => pin.message_id));
+      const hydrated = (await hydrateMessages((data || []) as Array<Record<string, unknown>>, chatId, pinnedIds)).reverse();
 
-      const hydrated = await Promise.all((data || []).map(async (row) => {
-        const message = { ...row, reactions: row.message_reactions || [], receipts: row.message_receipts || [], is_pinned: pinnedIds.has(row.id) } as Message & { message_reactions?: MessageReaction[]; message_receipts?: MessageReceipt[] };
-        if (message.media_path && !message.deleted_at) {
-          const { data: signed } = await supabase.storage.from('chat-media').createSignedUrl(message.media_path, 3600);
-          message.media_url = signed?.signedUrl;
-        }
-        if (message.encrypted_content && message.encryption_iv) {
-          const secret = chatSecrets.get(chatId);
-          const chat = chats.find((entry) => entry.id === chatId);
-          if (secret && chat?.encryption_salt) {
-            try { message.content = await decryptMessage(message.encrypted_content, message.encryption_iv, secret, chat.encryption_salt); }
-            catch { message.content = null; message.decryption_failed = true; }
-          } else {
-            message.content = null;
-            message.decryption_failed = true;
-          }
-        }
-        delete message.message_reactions;
-        delete message.message_receipts;
-        return message;
-      }));
-      setMessages(hydrated);
-      scrollToBottom();
+      setMessages((current) => {
+        const combined = mode === 'initial' ? hydrated : mode === 'older' ? [...hydrated, ...current] : [...current, ...hydrated];
+        const unique = Array.from(new Map(combined.map((message) => [message.id, message])).values())
+          .sort((left, right) => left.created_at.localeCompare(right.created_at) || left.id.localeCompare(right.id));
+        loadedMessageIdsRef.current = new Set(unique.map((message) => message.id));
+        return unique;
+      });
+      if (mode !== 'refresh') setHasOlderMessages((data || []).length === MESSAGE_PAGE_SIZE);
+      if (mode === 'initial') scrollToBottom();
+      if (mode === 'older' && viewport) {
+        requestAnimationFrame(() => { viewport.scrollTop = viewport.scrollHeight - previousScrollHeight; });
+      }
     } catch (err) {
       const message = databaseErrorMessage(err, 'Unable to load messages.');
       console.error('Error fetching messages:', message, err);
       setActionError(message);
+    } finally {
+      if (mode === 'initial') setMessagesLoading(false);
+      if (mode === 'older') setOlderMessagesLoading(false);
     }
   };
 
   useEffect(() => {
     const timeout = setTimeout(() => {
-      if (activeChatId) void fetchMessages(activeChatId);
-      else setMessages([]);
+      setMessages([]);
+      loadedMessageIdsRef.current = new Set();
+      previousMessageScrollTopRef.current = 0;
+      setHasOlderMessages(false);
+      if (activeChatId) void fetchMessages(activeChatId, 'initial');
     }, 0);
     return () => clearTimeout(timeout);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -328,21 +407,37 @@ export default function ChatPage() {
     const channel = supabase
       .channel('chat-presence', { config: { presence: { key: user.id }, broadcast: { self: false } } })
       .on('postgres_changes', { event: '*', schema: 'public', table: 'messages' }, (payload) => {
-        const newMessage = payload.new as Message;
-        if (activeChatId && newMessage.chat_id === activeChatId) void fetchMessages(activeChatId);
-        void fetchChatsAndProfiles();
+        const changed = (Object.keys(payload.new || {}).length ? payload.new : payload.old) as Partial<Message>;
+        if (activeChatId && (changed.chat_id === activeChatId || (!!changed.id && loadedMessageIdsRef.current.has(changed.id)))) {
+          void fetchMessages(activeChatId, 'refresh');
+        }
+        scheduleChatListRefresh();
       })
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'message_reactions' }, () => {
-        if (activeChatId) void fetchMessages(activeChatId);
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'message_reactions' }, (payload) => {
+        const changed = (Object.keys(payload.new || {}).length ? payload.new : payload.old) as Partial<MessageReaction>;
+        if (!changed.message_id || !changed.user_id || !changed.emoji || !loadedMessageIdsRef.current.has(changed.message_id)) return;
+        setMessages((current) => current.map((message) => {
+          if (message.id !== changed.message_id) return message;
+          const withoutChanged = (message.reactions || []).filter((reaction) => !(reaction.user_id === changed.user_id && reaction.emoji === changed.emoji));
+          return { ...message, reactions: payload.eventType === 'DELETE' ? withoutChanged : [...withoutChanged, changed as MessageReaction] };
+        }));
       })
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'message_pins' }, () => {
-        if (activeChatId) void fetchMessages(activeChatId);
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'message_pins' }, (payload) => {
+        const changed = (Object.keys(payload.new || {}).length ? payload.new : payload.old) as { chat_id?: string; message_id?: string };
+        if (!activeChatId || changed.chat_id !== activeChatId || !changed.message_id) return;
+        setMessages((current) => current.map((message) => message.id === changed.message_id ? { ...message, is_pinned: payload.eventType !== 'DELETE' } : message));
       })
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'chat_participants' }, () => {
-        void fetchChatsAndProfiles();
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'chat_participants', filter: `user_id=eq.${user.id}` }, () => {
+        scheduleChatListRefresh();
       })
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'message_receipts' }, () => {
-        if (activeChatId) void fetchMessages(activeChatId);
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'message_receipts' }, (payload) => {
+        const changed = (Object.keys(payload.new || {}).length ? payload.new : payload.old) as Partial<MessageReceipt>;
+        if (!changed.message_id || !changed.user_id || !loadedMessageIdsRef.current.has(changed.message_id)) return;
+        setMessages((current) => current.map((message) => {
+          if (message.id !== changed.message_id) return message;
+          const withoutChanged = (message.receipts || []).filter((receipt) => receipt.user_id !== changed.user_id);
+          return { ...message, receipts: payload.eventType === 'DELETE' ? withoutChanged : [...withoutChanged, changed as MessageReceipt] };
+        }));
       })
       .on('presence', { event: 'sync' }, () => {
         const ids = new Set<string>();
@@ -367,6 +462,7 @@ export default function ChatPage() {
 
     return () => {
       realtimeChannelRef.current = null;
+      if (chatRefreshTimerRef.current) clearTimeout(chatRefreshTimerRef.current);
       void supabase.removeChannel(channel);
     };
     // Re-subscribe only when the authenticated user or selected chat changes.
@@ -375,6 +471,8 @@ export default function ChatPage() {
 
   const broadcastTyping = (isTyping: boolean) => {
     if (!activeChat || !user) return;
+    typingActiveRef.current = isTyping;
+    lastTypingBroadcastRef.current = Date.now();
     void realtimeChannelRef.current?.send({ type: 'broadcast', event: 'typing', payload: { user_id: user.id, chat_id: activeChat.id, is_typing: isTyping } });
   };
 
@@ -386,9 +484,15 @@ export default function ChatPage() {
 
   const handleMessageInput = (value: string) => {
     setInputText(value);
-    broadcastTyping(!!value.trim());
+    const hasText = !!value.trim();
+    const now = Date.now();
+    if (hasText && (!typingActiveRef.current || now - lastTypingBroadcastRef.current >= TYPING_BROADCAST_INTERVAL_MS)) {
+      broadcastTyping(true);
+    } else if (!hasText && typingActiveRef.current) {
+      broadcastTyping(false);
+    }
     if (typingTimerRef.current) clearTimeout(typingTimerRef.current);
-    typingTimerRef.current = setTimeout(() => broadcastTyping(false), 1200);
+    if (hasText) typingTimerRef.current = setTimeout(() => broadcastTyping(false), 3000);
   };
 
   // 5. Send message action
@@ -430,8 +534,7 @@ export default function ChatPage() {
       });
       if (error) throw error;
       void notifyChatParticipants(activeChat.id);
-      await fetchMessages(activeChat.id);
-      await fetchChatsAndProfiles();
+      await fetchMessages(activeChat.id, 'refresh');
     } catch (err) {
       console.error('Failed to send message:', err);
       setInputText(textToSend);
@@ -504,7 +607,9 @@ export default function ChatPage() {
 
   const uploadMediaMessage = async (file: File, messageType: MessageType, durationSeconds?: number) => {
     if (!activeChat || !user || activeChat.is_blocked) return;
-    if (file.size > MAX_MEDIA_BYTES) throw new Error('Media must be smaller than 15 MB.');
+    if (messageType === 'image') validateUploadSize(file, IMAGE_MAX_BYTES, 'Image');
+    else if (messageType === 'voice') validateUploadSize(file, VOICE_MAX_BYTES, 'Voice note');
+    else throw new Error('Only images and voice notes are enabled in this free-tier build.');
 
     setIsUploading(true);
     setActionError(null);
@@ -536,9 +641,7 @@ export default function ChatPage() {
       }
 
       void notifyChatParticipants(activeChat.id);
-
-      await fetchMessages(activeChat.id);
-      await fetchChatsAndProfiles();
+      await fetchMessages(activeChat.id, 'refresh');
     } finally {
       setIsUploading(false);
     }
@@ -548,12 +651,15 @@ export default function ChatPage() {
     const file = event.target.files?.[0];
     event.target.value = '';
     if (!file) return;
-    if (!file.type.startsWith('image/')) {
+    if (!['image/jpeg', 'image/png', 'image/webp', 'image/gif'].includes(file.type)) {
       setActionError('Choose a JPEG, PNG, WebP, or GIF image.');
       return;
     }
     try {
-      await uploadMediaMessage(file, 'image');
+      if (file.size > 10 * 1024 * 1024) throw new Error('The original image must be 10 MB or smaller before optimization.');
+      const optimized = await compressImageForUpload(file);
+      validateUploadSize(optimized, IMAGE_MAX_BYTES, 'Image');
+      await uploadMediaMessage(optimized, 'image');
     } catch (error) {
       setActionError(error instanceof Error ? error.message : 'The image could not be sent.');
     }
@@ -585,6 +691,8 @@ export default function ChatPage() {
         if (event.data.size) recordingChunksRef.current.push(event.data);
       };
       recorder.onstop = async () => {
+        if (recordingLimitTimerRef.current) clearTimeout(recordingLimitTimerRef.current);
+        recordingLimitTimerRef.current = null;
         const mimeType = recorder.mimeType || 'audio/webm';
         const extension = mimeType.includes('ogg') ? 'ogg' : mimeType.includes('mp4') ? 'm4a' : 'webm';
         const blob = new Blob(recordingChunksRef.current, { type: mimeType });
@@ -601,6 +709,9 @@ export default function ChatPage() {
         }
       };
       recorder.start(250);
+      recordingLimitTimerRef.current = setTimeout(() => {
+        if (recorder.state === 'recording') recorder.stop();
+      }, 5 * 60 * 1000);
       setIsRecording(true);
     } catch (error) {
       mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
@@ -618,7 +729,6 @@ export default function ChatPage() {
       ? await query.delete().eq('message_id', message.id).eq('user_id', user.id).eq('emoji', emoji)
       : await query.insert({ message_id: message.id, user_id: user.id, emoji });
     if (error) setActionError(error.message);
-    else if (activeChat) await fetchMessages(activeChat.id);
   };
 
   const openChat = async (chat: Chat) => {
@@ -637,6 +747,9 @@ export default function ChatPage() {
       if (!secret) return;
       setChatSecrets((current) => new Map(current).set(chat.id, secret));
     }
+    typingActiveRef.current = false;
+    lastTypingBroadcastRef.current = 0;
+    setTypingUserIds(new Set());
     setActiveChat(chat);
     setShowChatMenu(false);
     setMessageActionId(null);
@@ -762,8 +875,7 @@ export default function ChatPage() {
         if (error) throw error;
         window.alert('Report submitted to the moderation team.');
       }
-      await fetchMessages(activeChat.id);
-      await fetchChatsAndProfiles();
+      if (action !== 'report') await fetchMessages(activeChat.id, 'refresh');
     } catch (error) {
       setActionError(error instanceof Error ? error.message : 'The message could not be updated.');
     }
@@ -788,6 +900,8 @@ export default function ChatPage() {
     mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
     if (longPressTimerRef.current) clearTimeout(longPressTimerRef.current);
     if (typingTimerRef.current) clearTimeout(typingTimerRef.current);
+    if (recordingLimitTimerRef.current) clearTimeout(recordingLimitTimerRef.current);
+    if (chatRefreshTimerRef.current) clearTimeout(chatRefreshTimerRef.current);
   }, []);
 
   // 7. Update profile action
@@ -812,6 +926,15 @@ export default function ChatPage() {
   const activeTypingNames = activeChat?.participants?.filter((entry) => typingUserIds.has(entry.id)).map((entry) => entry.display_name) || [];
   const activeChatOnline = activeChat?.participants?.some((entry) => onlineUserIds.has(entry.id)) || false;
   const filteredChats = filterChats(chats, chatFilter, searchQuery);
+
+  const handleMessageScroll = (event: React.UIEvent<HTMLDivElement>) => {
+    const nextScrollTop = event.currentTarget.scrollTop;
+    const scrollingUp = nextScrollTop < previousMessageScrollTopRef.current;
+    previousMessageScrollTopRef.current = nextScrollTop;
+    if (scrollingUp && nextScrollTop < 100 && activeChatId && hasOlderMessages && !olderMessagesLoading) {
+      void fetchMessages(activeChatId, 'older');
+    }
+  };
 
   const filteredProfiles = profiles.filter((p) =>
     p.display_name?.toLowerCase().includes(newChatSearch.toLowerCase()) ||
@@ -1050,7 +1173,9 @@ export default function ChatPage() {
 
           {/* Chat List Items */}
           <div className="flex-1 overflow-y-auto px-2 pb-24 md:pb-3">
-            {filteredChats.length === 0 ? (
+            {chatsLoading ? (
+              <div className="flex h-40 items-center justify-center"><Loader2 className="h-6 w-6 animate-spin text-blue-400" aria-label="Loading chats" /></div>
+            ) : filteredChats.length === 0 ? (
               <div className="p-8 text-center flex flex-col items-center justify-center space-y-3">
                 <MessageSquare className="w-10 h-10 text-gray-600" />
                 <p className="text-gray-500 text-sm">No {chatFilter === 'all' ? 'active' : chatFilter} chats found.</p>
@@ -1236,7 +1361,16 @@ export default function ChatPage() {
               )}
 
               {/* Chat messages viewport */}
-              <div className="flex-1 overflow-y-auto p-4 space-y-4 chat-bg-pattern">
+              <div ref={messagesViewportRef} onScroll={handleMessageScroll} className="flex-1 overflow-y-auto p-3 sm:p-4 space-y-4 chat-bg-pattern">
+                {hasOlderMessages && !messagesLoading && (
+                  <div className="flex justify-center">
+                    <button type="button" disabled={olderMessagesLoading} onClick={() => void fetchMessages(activeChat.id, 'older')} className="rounded-full border border-white/10 bg-[#202624]/90 px-4 py-2 text-xs font-semibold text-gray-300 shadow hover:bg-[#29312e] disabled:opacity-60">
+                      {olderMessagesLoading ? <span className="flex items-center gap-2"><Loader2 className="h-3.5 w-3.5 animate-spin" />Loading older messages</span> : 'Load older messages'}
+                    </button>
+                  </div>
+                )}
+                {messagesLoading && <div className="flex h-32 flex-col items-center justify-center gap-3 text-sm text-gray-400"><Loader2 className="h-7 w-7 animate-spin text-blue-400" /><span>Loading recent messages…</span></div>}
+                {!messagesLoading && messages.length === 0 && <div className="flex h-40 flex-col items-center justify-center gap-3 text-center text-gray-500"><MessageSquare className="h-9 w-9" /><div><p className="text-sm font-semibold text-gray-300">No messages yet</p><p className="mt-1 text-xs">Send the first message in this conversation.</p></div></div>}
                 <AnimatePresence initial={false}>
                   {messages.map((message) => <MessageBubble key={message.id} message={message} chat={activeChat} currentUserId={user.id} actionOpen={messageActionId === message.id} reactionPickerOpen={reactingTo === message.id} onBeginLongPress={() => beginLongPress(message.id)} onCancelLongPress={cancelLongPress} onOpenActions={() => setMessageActionId(message.id)} onAction={(action) => void runMessageAction(message, action)} onToggleReactionPicker={() => setReactingTo((current) => current === message.id ? null : message.id)} onReaction={(emoji) => void toggleReaction(message, emoji)} />)}
                 </AnimatePresence>
@@ -1447,7 +1581,7 @@ export default function ChatPage() {
         </AnimatePresence>
 
         <CallOverlay call={callManager.call} incomingCall={callManager.incomingCall} localStream={callManager.localStream} remoteStream={callManager.remoteStream} callerName={chats.find((chat) => chat.id === (callManager.incomingCall || callManager.call)?.chat_id)?.name || '3SChat user'} onAccept={() => void callManager.acceptCall()} onDecline={() => void callManager.declineCall()} onEnd={() => void callManager.endCall()} />
-        {utilityPanel && <UtilityPanel mode={utilityPanel} userId={user.id} onClose={() => setUtilityPanel(null)} />}
+        {utilityPanel && <UtilityPanel mode={utilityPanel} userId={user.id} profile={profile} onClose={() => setUtilityPanel(null)} />}
 
         {/* ========================================================= */}
         {/* PROFILE / SETTINGS EDIT MODAL                             */}

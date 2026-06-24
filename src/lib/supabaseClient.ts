@@ -19,7 +19,7 @@ export const supabase = createClient(supabaseUrl, supabaseAnonKey, {
 
 export interface Profile {
   id: string;
-  phone_number: string;
+  phone_number: string | null;
   email?: string;
   display_name: string;
   avatar_url: string | null;
@@ -48,6 +48,16 @@ export interface Chat {
   member_role?: 'owner' | 'admin' | 'member';
   encryption_enabled?: boolean;
   encryption_salt?: string | null;
+}
+
+export interface ChatSummary {
+  chat_id: string;
+  last_message_content: string | null;
+  last_message_type: MessageType | null;
+  last_message_encrypted: boolean;
+  last_message_deleted_at: string | null;
+  last_message_created_at: string | null;
+  unread_count: number;
 }
 
 export type MessageType = 'text' | 'image' | 'voice' | 'file';
@@ -110,6 +120,7 @@ export interface StatusUpdate {
   created_at: string;
   expires_at: string;
   profiles?: Profile;
+  media_url?: string;
 }
 
 export interface UserSession {

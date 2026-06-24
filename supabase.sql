@@ -6,7 +6,7 @@ create extension if not exists pgcrypto;
 
 create table if not exists public.profiles (
   id uuid primary key references auth.users(id) on delete cascade,
-  phone_number text not null unique,
+  phone_number text unique,
   display_name text not null,
   avatar_url text,
   status text not null default 'Hey there! I am using 3SChat.',
@@ -19,11 +19,14 @@ alter table public.profiles add column if not exists role text not null default 
 alter table public.profiles add column if not exists account_status text not null default 'active';
 alter table public.profiles add column if not exists suspension_reason text;
 alter table public.profiles add column if not exists suspended_at timestamptz;
+alter table public.profiles alter column phone_number drop not null;
 alter table public.profiles drop constraint if exists profiles_role_check;
 alter table public.profiles add constraint profiles_role_check check (role in ('user', 'moderator', 'admin'));
 alter table public.profiles drop constraint if exists profiles_account_status_check;
 alter table public.profiles add constraint profiles_account_status_check check (account_status in ('active', 'suspended'));
-update public.profiles set display_name = 'User ' || right(phone_number, 4) where display_name is null;
+update public.profiles
+set display_name = 'User ' || coalesce(nullif(right(phone_number, 4), ''), left(id::text, 8))
+where display_name is null;
 alter table public.profiles alter column display_name set not null;
 
 create table if not exists public.chats (
@@ -264,6 +267,7 @@ alter table public.user_sessions alter column active_session_id set not null;
 
 create index if not exists chat_participants_user_idx on public.chat_participants(user_id, chat_id);
 create index if not exists messages_chat_created_idx on public.messages(chat_id, created_at);
+create index if not exists messages_chat_created_id_idx on public.messages(chat_id, created_at desc, id desc);
 create index if not exists reactions_message_idx on public.message_reactions(message_id);
 create index if not exists message_pins_chat_idx on public.message_pins(chat_id, pinned_at desc);
 create index if not exists message_receipts_user_idx on public.message_receipts(user_id, read_at);
@@ -444,6 +448,51 @@ begin
 
   return found_chat_id;
 end;
+$$;
+
+-- One compact row per conversation for the chat list. This avoids downloading
+-- every message and receipt whenever the sidebar refreshes.
+create or replace function public.get_chat_summaries()
+returns table (
+  chat_id uuid,
+  last_message_content text,
+  last_message_type text,
+  last_message_encrypted boolean,
+  last_message_deleted_at timestamptz,
+  last_message_created_at timestamptz,
+  unread_count bigint
+)
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select
+    membership.chat_id,
+    latest.content,
+    latest.message_type,
+    latest.encrypted_content is not null,
+    latest.deleted_at,
+    latest.created_at,
+    coalesce(unread.total, 0)
+  from public.chat_participants membership
+  left join lateral (
+    select m.content, m.message_type, m.encrypted_content, m.deleted_at, m.created_at
+    from public.messages m
+    where m.chat_id = membership.chat_id
+    order by m.created_at desc, m.id desc
+    limit 1
+  ) latest on true
+  left join lateral (
+    select count(*) as total
+    from public.messages m
+    where m.chat_id = membership.chat_id
+      and m.sender_id <> auth.uid()
+      and m.deleted_at is null
+      and m.created_at > membership.last_read_at
+  ) unread on true
+  where membership.user_id = auth.uid()
+    and public.is_active_session();
 $$;
 
 create or replace function public.set_chat_preferences(
@@ -875,15 +924,29 @@ as $$
 declare
   supplied_phone text;
   supplied_name text;
+  supplied_avatar text;
+  auth_provider text;
 begin
   supplied_phone := coalesce(nullif(new.raw_user_meta_data ->> 'phone_number', ''), nullif(new.phone, ''));
-  if supplied_phone is null then
+  auth_provider := coalesce(nullif(new.raw_app_meta_data ->> 'provider', ''), 'email');
+  if supplied_phone is null and auth_provider <> 'google' then
     raise exception 'A phone number is required for 3SChat accounts';
   end if;
 
-  supplied_name := coalesce(nullif(btrim(new.raw_user_meta_data ->> 'display_name'), ''), 'User ' || right(supplied_phone, 4));
-  insert into public.profiles(id, phone_number, display_name)
-  values (new.id, supplied_phone, supplied_name)
+  supplied_name := coalesce(
+    nullif(btrim(new.raw_user_meta_data ->> 'display_name'), ''),
+    nullif(btrim(new.raw_user_meta_data ->> 'full_name'), ''),
+    nullif(btrim(new.raw_user_meta_data ->> 'name'), ''),
+    nullif(split_part(coalesce(new.email, ''), '@', 1), ''),
+    case when supplied_phone is not null then 'User ' || right(supplied_phone, 4) end,
+    'Google user'
+  );
+  supplied_avatar := coalesce(
+    nullif(new.raw_user_meta_data ->> 'avatar_url', ''),
+    nullif(new.raw_user_meta_data ->> 'picture', '')
+  );
+  insert into public.profiles(id, phone_number, display_name, avatar_url)
+  values (new.id, supplied_phone, left(supplied_name, 60), supplied_avatar)
   on conflict (id) do nothing;
   return new;
 end;
@@ -1004,6 +1067,7 @@ revoke all on function public.change_phone_number(text) from public, anon;
 revoke all on function public.is_chat_member(uuid) from public, anon;
 revoke all on function public.create_direct_chat(uuid) from public, anon;
 revoke all on function public.create_self_chat() from public, anon;
+revoke all on function public.get_chat_summaries() from public, anon;
 revoke all on function public.set_chat_preferences(uuid, boolean, boolean) from public, anon;
 revoke all on function public.set_chat_archived(uuid, boolean) from public, anon;
 revoke all on function public.enable_chat_encryption(uuid) from public, anon;
@@ -1035,6 +1099,7 @@ grant execute on function public.change_phone_number(text) to authenticated;
 grant execute on function public.is_chat_member(uuid) to authenticated;
 grant execute on function public.create_direct_chat(uuid) to authenticated;
 grant execute on function public.create_self_chat() to authenticated;
+grant execute on function public.get_chat_summaries() to authenticated;
 grant execute on function public.set_chat_preferences(uuid, boolean, boolean) to authenticated;
 grant execute on function public.set_chat_archived(uuid, boolean) to authenticated;
 grant execute on function public.enable_chat_encryption(uuid) to authenticated;
@@ -1059,8 +1124,18 @@ grant execute on function public.admin_review_report(uuid, text, text) to authen
 
 insert into storage.buckets(id, name, public, file_size_limit, allowed_mime_types)
 values (
-  'chat-media', 'chat-media', false, 15728640,
+  'chat-media', 'chat-media', false, 5242880,
   array['image/jpeg','image/png','image/webp','image/gif','audio/webm','audio/ogg','audio/mp4','audio/mpeg']
+)
+on conflict (id) do update set
+  public = excluded.public,
+  file_size_limit = excluded.file_size_limit,
+  allowed_mime_types = excluded.allowed_mime_types;
+
+insert into storage.buckets(id, name, public, file_size_limit, allowed_mime_types)
+values (
+  'status-media', 'status-media', false, 5242880,
+  array['image/jpeg','image/png','image/webp','image/gif']
 )
 on conflict (id) do update set
   public = excluded.public,
@@ -1083,6 +1158,24 @@ create policy chat_media_delete on storage.objects for delete to authenticated u
   bucket_id = 'chat-media'
   and (storage.foldername(name))[2] = auth.uid()::text
   and public.is_chat_member((storage.foldername(name))[1]::uuid)
+);
+
+drop policy if exists status_media_read on storage.objects;
+drop policy if exists status_media_upload on storage.objects;
+drop policy if exists status_media_delete on storage.objects;
+
+create policy status_media_read on storage.objects for select to authenticated using (
+  bucket_id = 'status-media' and public.is_active_session()
+);
+create policy status_media_upload on storage.objects for insert to authenticated with check (
+  bucket_id = 'status-media'
+  and (storage.foldername(name))[1] = auth.uid()::text
+  and public.is_active_session()
+);
+create policy status_media_delete on storage.objects for delete to authenticated using (
+  bucket_id = 'status-media'
+  and (storage.foldername(name))[1] = auth.uid()::text
+  and public.is_active_session()
 );
 
 do $$
