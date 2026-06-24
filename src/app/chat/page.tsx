@@ -33,24 +33,38 @@ import {
   X,
   Sparkles,
   StopCircle,
-  Paperclip
+  Paperclip,
+  Star,
+  Unlock,
+  Ban
 } from 'lucide-react';
+import { Video } from 'lucide-react';
+import { CallOverlay } from '../../components/chat/CallOverlay';
+import { UtilityPanel } from '../../components/chat/UtilityPanel';
+import { PushNotificationButton } from '../../components/chat/PushNotificationButton';
+import { MessageBubble } from '../../components/chat/MessageBubble';
+import { useWebRtcCall } from '../../hooks/useWebRtcCall';
+import { pendingMessages, queueMessage, removePendingMessage } from '../../lib/offlineQueue';
+import { decryptMessage, encryptMessage } from '../../lib/e2ee';
+import { filterChats, unreadTotal, type ChatFilterValue } from '../../lib/chatUtils';
 import { 
   supabase, 
   Profile, 
   Chat, 
   Message,
   MessageReaction,
+  MessageReceipt,
   MessageType,
+  databaseErrorMessage,
 } from '../../lib/supabaseClient';
 
 const EMOJIS = ['😀', '😂', '😍', '👍', '❤️', '🔥', '🎉', '😮'];
-const REACTION_EMOJIS = ['👍', '❤️', '😂', '😮', '😢', '🔥'];
 const MAX_MEDIA_BYTES = 15 * 1024 * 1024;
 
 export default function ChatPage() {
-  const { user, profile, logout, updateProfile, loading } = useAuth();
+  const { user, profile, logout, updateProfile, changeEmail, changePhone, loading } = useAuth();
   const router = useRouter();
+  const callManager = useWebRtcCall(user?.id);
 
   // Navigation / Panel states
   const [chats, setChats] = useState<Chat[]>([]);
@@ -68,6 +82,18 @@ export default function ChatPage() {
   const [isUploading, setIsUploading] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [chatFilter, setChatFilter] = useState<ChatFilterValue>('all');
+  const [showChatMenu, setShowChatMenu] = useState(false);
+  const [messageActionId, setMessageActionId] = useState<string | null>(null);
+  const [unlockedChatIds, setUnlockedChatIds] = useState<Set<string>>(() => new Set());
+  const [showGroupModal, setShowGroupModal] = useState(false);
+  const [groupEditChat, setGroupEditChat] = useState<Chat | null>(null);
+  const [groupName, setGroupName] = useState('');
+  const [groupMemberIds, setGroupMemberIds] = useState<Set<string>>(() => new Set());
+  const [onlineUserIds, setOnlineUserIds] = useState<Set<string>>(() => new Set());
+  const [typingUserIds, setTypingUserIds] = useState<Set<string>>(() => new Set());
+  const [utilityPanel, setUtilityPanel] = useState<'updates' | 'communities' | 'calls' | null>(null);
+  const [chatSecrets, setChatSecrets] = useState<Map<string, string>>(() => new Map());
 
   // Input states
   const [inputText, setInputText] = useState('');
@@ -76,6 +102,8 @@ export default function ChatPage() {
   const [editName, setEditName] = useState('');
   const [editStatus, setEditStatus] = useState('');
   const [editAvatar, setEditAvatar] = useState('');
+  const [editEmail, setEditEmail] = useState('');
+  const [editPhone, setEditPhone] = useState('');
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -83,6 +111,10 @@ export default function ChatPage() {
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const recordingChunksRef = useRef<Blob[]>([]);
   const recordingStartedRef = useRef(0);
+  const longPressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const typingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const realtimeChannelRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
+  const activeChatId = activeChat?.id;
 
   // 1. Guard route: redirect if logged out
   useEffect(() => {
@@ -97,55 +129,119 @@ export default function ChatPage() {
     }, 100);
   };
 
+  const flushOfflineQueue = async () => {
+    if (!user || !navigator.onLine) return;
+    const queued = await pendingMessages(user.id);
+    for (const entry of queued) {
+      const { error } = await supabase.from('messages').insert({ chat_id: entry.chatId, sender_id: entry.senderId, content: entry.content, encrypted_content: entry.encryptedContent, encryption_iv: entry.encryptionIv, encryption_version: entry.encryptionVersion, message_type: 'text' });
+      if (!error) await removePendingMessage(entry.id);
+    }
+    if (queued.length) setActionError('Queued messages were sent.');
+  };
+
   // 2. Fetch chats list and other profiles
   const fetchChatsAndProfiles = async () => {
     if (!user) return;
     try {
       const { data: participantsData, error: cpError } = await supabase
         .from('chat_participants')
-        .select('chat_id')
+        .select('chat_id, is_favorite, is_locked, is_archived, member_role')
         .eq('user_id', user.id);
       if (cpError) throw cpError;
 
       const chatIds = (participantsData || []).map((participant) => participant.chat_id);
       if (chatIds.length) {
-        const { data: chatsData, error: chatsError } = await supabase
-          .from('chats')
-          .select('*, chat_participants(user_id, profiles(*))')
-          .in('id', chatIds)
-          .order('updated_at', { ascending: false });
+        const [{ data: chatsData, error: chatsError }, { data: messageData, error: messageError }, { data: blockedData, error: blockedError }, { data: receiptData, error: receiptError }] = await Promise.all([
+          supabase
+            .from('chats')
+            .select('*, chat_participants(user_id, profiles(*))')
+            .in('id', chatIds)
+            .order('updated_at', { ascending: false }),
+          supabase
+            .from('messages')
+            .select('id, chat_id, sender_id, content, encrypted_content, message_type, is_read, created_at, deleted_at')
+            .in('chat_id', chatIds)
+            .order('created_at', { ascending: false }),
+          supabase
+            .from('blocked_users')
+            .select('blocked_id')
+            .eq('blocker_id', user.id),
+          supabase
+            .from('message_receipts')
+            .select('message_id')
+            .eq('user_id', user.id)
+            .not('read_at', 'is', null),
+        ]);
         if (chatsError) throw chatsError;
+        if (messageError) throw messageError;
+        if (blockedError) throw blockedError;
+        if (receiptError) throw receiptError;
+
+        const preferences = new Map((participantsData || []).map((participant) => [participant.chat_id, participant]));
+        const latestByChat = new Map<string, NonNullable<typeof messageData>[number]>();
+        const unreadByChat = new Map<string, number>();
+        const blockedIds = new Set((blockedData || []).map((block) => block.blocked_id));
+        const readMessageIds = new Set((receiptData || []).map((receipt) => receipt.message_id));
+        for (const message of messageData || []) {
+          if (!latestByChat.has(message.chat_id)) latestByChat.set(message.chat_id, message);
+          if (message.sender_id !== user.id && !readMessageIds.has(message.id)) {
+            unreadByChat.set(message.chat_id, (unreadByChat.get(message.chat_id) || 0) + 1);
+          }
+        }
 
         const formattedChats = (chatsData || []).map((chat) => {
           const rows = chat.chat_participants as unknown as Array<{ user_id: string; profiles: Profile | Profile[] }>;
+          const isSelf = rows.length === 1 && rows[0]?.user_id === user.id;
           const listParticipants = rows
             .filter((participant) => participant.user_id !== user.id)
             .flatMap((participant) => Array.isArray(participant.profiles) ? participant.profiles : [participant.profiles])
             .filter(Boolean);
+          if (isSelf && profile) listParticipants.push(profile);
+          const preference = preferences.get(chat.id);
+          const latest = latestByChat.get(chat.id);
+          const preview = latest?.deleted_at
+            ? 'Message deleted'
+            : latest?.message_type === 'image'
+              ? '📷 Image'
+              : latest?.message_type === 'voice'
+                ? '🎙 Voice message'
+                : latest?.encrypted_content ? '🔒 Encrypted message' : latest?.content;
           return {
             id: chat.id,
-            name: chat.is_group ? (chat.name || 'Group') : (listParticipants[0]?.display_name || 'Direct chat'),
+            name: isSelf ? `${profile?.display_name || 'Me'} (You)` : chat.is_group ? (chat.name || 'Group') : (listParticipants[0]?.display_name || 'Direct chat'),
             is_group: chat.is_group,
             created_at: chat.created_at,
             updated_at: chat.updated_at,
             participants: listParticipants,
+            is_self: isSelf,
+            is_favorite: preference?.is_favorite || false,
+            is_locked: preference?.is_locked || false,
+            is_archived: preference?.is_archived || false,
+            member_role: preference?.member_role || 'member',
+            encryption_enabled: chat.encryption_enabled || false,
+            encryption_salt: chat.encryption_salt,
+            unread_count: unreadByChat.get(chat.id) || 0,
+            last_message: preview || null,
+            is_blocked: !isSelf && !!listParticipants[0] && blockedIds.has(listParticipants[0].id),
           } as Chat;
         });
         setChats(formattedChats);
+        setActiveChat((current) => current ? (formattedChats.find((chat) => chat.id === current.id) || current) : current);
       } else {
         setChats([]);
       }
 
       const { data: allProfiles, error: profilesError } = await supabase
         .from('profiles')
-        .select('id, phone_number, display_name, avatar_url, status, last_seen')
+        .select('id, phone_number, display_name, avatar_url, status, last_seen, role, account_status')
         .neq('id', user.id)
         .order('display_name');
       if (profilesError) throw profilesError;
       setProfiles((allProfiles || []) as Profile[]);
     } catch (err) {
-      console.error('Error fetching chats/profiles:', err);
-      setActionError(err instanceof Error ? err.message : 'Unable to load conversations.');
+      const message = databaseErrorMessage(err, 'Unable to load conversations.');
+      console.error('Error fetching chats/profiles:', message, err);
+      setActionError(message);
     }
   };
 
@@ -157,88 +253,183 @@ export default function ChatPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user]);
 
+  useEffect(() => {
+    if (!user) return;
+    const flush = () => void flushOfflineQueue();
+    window.addEventListener('online', flush);
+    const timeout = setTimeout(flush, 0);
+    return () => { clearTimeout(timeout); window.removeEventListener('online', flush); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user]);
+
   // 3. Fetch messages for active chat
   const fetchMessages = async (chatId: string) => {
     try {
       const { error: readError } = await supabase.rpc('mark_chat_read', { target_chat_id: chatId });
       if (readError) throw readError;
-      const { data, error } = await supabase
-        .from('messages')
-        .select('*, message_reactions(*)')
-        .eq('chat_id', chatId)
-        .order('created_at', { ascending: true });
+      const [{ data, error }, { data: pinData, error: pinError }] = await Promise.all([
+        supabase
+          .from('messages')
+          .select('*, message_reactions(*), message_receipts(*)')
+          .eq('chat_id', chatId)
+          .order('created_at', { ascending: true }),
+        supabase
+          .from('message_pins')
+          .select('message_id, pinned_at')
+          .eq('chat_id', chatId)
+          .order('pinned_at', { ascending: false }),
+      ]);
       if (error) throw error;
+      if (pinError) throw pinError;
+      const pinnedIds = new Set((pinData || []).map((pin) => pin.message_id));
 
       const hydrated = await Promise.all((data || []).map(async (row) => {
-        const message = { ...row, reactions: row.message_reactions || [] } as Message & { message_reactions?: MessageReaction[] };
-        if (message.media_path) {
+        const message = { ...row, reactions: row.message_reactions || [], receipts: row.message_receipts || [], is_pinned: pinnedIds.has(row.id) } as Message & { message_reactions?: MessageReaction[]; message_receipts?: MessageReceipt[] };
+        if (message.media_path && !message.deleted_at) {
           const { data: signed } = await supabase.storage.from('chat-media').createSignedUrl(message.media_path, 3600);
           message.media_url = signed?.signedUrl;
         }
+        if (message.encrypted_content && message.encryption_iv) {
+          const secret = chatSecrets.get(chatId);
+          const chat = chats.find((entry) => entry.id === chatId);
+          if (secret && chat?.encryption_salt) {
+            try { message.content = await decryptMessage(message.encrypted_content, message.encryption_iv, secret, chat.encryption_salt); }
+            catch { message.content = null; message.decryption_failed = true; }
+          } else {
+            message.content = null;
+            message.decryption_failed = true;
+          }
+        }
         delete message.message_reactions;
+        delete message.message_receipts;
         return message;
       }));
       setMessages(hydrated);
       scrollToBottom();
     } catch (err) {
-      console.error('Error fetching messages:', err);
-      setActionError(err instanceof Error ? err.message : 'Unable to load messages.');
+      const message = databaseErrorMessage(err, 'Unable to load messages.');
+      console.error('Error fetching messages:', message, err);
+      setActionError(message);
     }
   };
 
   useEffect(() => {
     const timeout = setTimeout(() => {
-      if (activeChat) void fetchMessages(activeChat.id);
+      if (activeChatId) void fetchMessages(activeChatId);
       else setMessages([]);
     }, 0);
     return () => clearTimeout(timeout);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeChat]);
-
-  useEffect(() => {
-    if (activeChat || !chats.length) return;
-    const timeout = setTimeout(() => setActiveChat(chats[0]), 0);
-    return () => clearTimeout(timeout);
-  }, [activeChat, chats]);
+  }, [activeChatId]);
 
   // 4. Realtime subscriber for new messages
   useEffect(() => {
     if (!user) return;
     const channel = supabase
-      .channel(`chat-events-${user.id}`)
+      .channel('chat-presence', { config: { presence: { key: user.id }, broadcast: { self: false } } })
       .on('postgres_changes', { event: '*', schema: 'public', table: 'messages' }, (payload) => {
         const newMessage = payload.new as Message;
-        if (activeChat && newMessage.chat_id === activeChat.id) void fetchMessages(activeChat.id);
+        if (activeChatId && newMessage.chat_id === activeChatId) void fetchMessages(activeChatId);
         void fetchChatsAndProfiles();
       })
       .on('postgres_changes', { event: '*', schema: 'public', table: 'message_reactions' }, () => {
-        if (activeChat) void fetchMessages(activeChat.id);
+        if (activeChatId) void fetchMessages(activeChatId);
       })
-      .subscribe();
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'message_pins' }, () => {
+        if (activeChatId) void fetchMessages(activeChatId);
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'chat_participants' }, () => {
+        void fetchChatsAndProfiles();
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'message_receipts' }, () => {
+        if (activeChatId) void fetchMessages(activeChatId);
+      })
+      .on('presence', { event: 'sync' }, () => {
+        const ids = new Set<string>();
+        for (const entries of Object.values(channel.presenceState())) {
+          for (const entry of entries as Array<{ user_id?: string }>) if (entry.user_id) ids.add(entry.user_id);
+        }
+        setOnlineUserIds(ids);
+      })
+      .on('broadcast', { event: 'typing' }, ({ payload }) => {
+        const event = payload as { user_id?: string; chat_id?: string; is_typing?: boolean };
+        if (!event.user_id || event.chat_id !== activeChatId) return;
+        setTypingUserIds((current) => {
+          const next = new Set(current);
+          if (event.is_typing) next.add(event.user_id!); else next.delete(event.user_id!);
+          return next;
+        });
+      })
+      .subscribe((status) => {
+        if (status === 'SUBSCRIBED') void channel.track({ user_id: user.id, online_at: new Date().toISOString() });
+      });
+    realtimeChannelRef.current = channel;
 
     return () => {
+      realtimeChannelRef.current = null;
       void supabase.removeChannel(channel);
     };
     // Re-subscribe only when the authenticated user or selected chat changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [user, activeChat]);
+  }, [user, activeChatId]);
+
+  const broadcastTyping = (isTyping: boolean) => {
+    if (!activeChat || !user) return;
+    void realtimeChannelRef.current?.send({ type: 'broadcast', event: 'typing', payload: { user_id: user.id, chat_id: activeChat.id, is_typing: isTyping } });
+  };
+
+  const notifyChatParticipants = async (chatId: string) => {
+    const { data: { session } } = await supabase.auth.getSession();
+    if (!session) return;
+    await fetch('/api/push/notify', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${session.access_token}` }, body: JSON.stringify({ chatId, title: profile?.display_name || '3SChat', body: 'New message' }) }).catch(() => undefined);
+  };
+
+  const handleMessageInput = (value: string) => {
+    setInputText(value);
+    broadcastTyping(!!value.trim());
+    if (typingTimerRef.current) clearTimeout(typingTimerRef.current);
+    typingTimerRef.current = setTimeout(() => broadcastTyping(false), 1200);
+  };
 
   // 5. Send message action
   const handleSendMessage = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!inputText.trim() || !activeChat || !user) return;
+    if (!inputText.trim() || !activeChat || !user || activeChat.is_blocked) return;
 
     const textToSend = inputText;
     setInputText('');
+    broadcastTyping(false);
+
+    let encrypted: Awaited<ReturnType<typeof encryptMessage>> | null = null;
+    if (activeChat.encryption_enabled) {
+      const secret = chatSecrets.get(activeChat.id);
+      if (!secret || !activeChat.encryption_salt) {
+        setInputText(textToSend);
+        setActionError('Enter the shared encryption secret before sending.');
+        return;
+      }
+      encrypted = await encryptMessage(textToSend.trim(), secret, activeChat.encryption_salt);
+    }
+
+    if (!navigator.onLine) {
+      const queued = { id: crypto.randomUUID(), chatId: activeChat.id, senderId: user.id, content: encrypted ? null : textToSend.trim(), encryptedContent: encrypted?.encrypted_content, encryptionIv: encrypted?.encryption_iv, encryptionVersion: encrypted?.encryption_version, createdAt: new Date().toISOString() };
+      await queueMessage(queued);
+      setMessages((current) => [...current, { id: queued.id, chat_id: queued.chatId, sender_id: queued.senderId, content: textToSend.trim(), message_type: 'text', media_path: null, media_mime_type: null, media_size: null, duration_seconds: null, created_at: queued.createdAt, updated_at: queued.createdAt, is_read: false, pending: true }]);
+      setActionError('Offline: message queued and will send when the connection returns.');
+      return;
+    }
 
     try {
       const { error } = await supabase.from('messages').insert({
         chat_id: activeChat.id,
         sender_id: user.id,
-        content: textToSend.trim(),
+        content: encrypted ? null : textToSend.trim(),
+        ...encrypted,
         message_type: 'text',
+        is_read: !!activeChat.is_self,
       });
       if (error) throw error;
+      void notifyChatParticipants(activeChat.id);
       await fetchMessages(activeChat.id);
       await fetchChatsAndProfiles();
     } catch (err) {
@@ -272,8 +463,47 @@ export default function ChatPage() {
     }
   };
 
+  const openGroupEditor = (chat?: Chat) => {
+    setGroupEditChat(chat || null);
+    setGroupName(chat?.name || '');
+    setGroupMemberIds(new Set());
+    setShowGroupModal(true);
+    setShowChatMenu(false);
+  };
+
+  const saveGroup = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!groupName.trim()) return;
+    setIsUploading(true);
+    const memberIds = Array.from(groupMemberIds);
+    const result = groupEditChat
+      ? await supabase.rpc('update_group', { target_chat_id: groupEditChat.id, group_name: groupName, add_member_ids: memberIds })
+      : await supabase.rpc('create_group', { group_name: groupName, member_ids: memberIds });
+    setIsUploading(false);
+    if (result.error) {
+      setActionError(result.error.message);
+      return;
+    }
+    setShowGroupModal(false);
+    if (!groupEditChat && result.data) {
+      setActiveChat({ id: result.data, name: groupName.trim(), is_group: true, created_at: new Date().toISOString(), participants: profiles.filter((entry) => groupMemberIds.has(entry.id)), member_role: 'owner' });
+      setMobileView('chat');
+    }
+    await fetchChatsAndProfiles();
+  };
+
+  const removeGroupMember = async (member: Profile) => {
+    if (!groupEditChat || !window.confirm(`Remove ${member.display_name} from this group?`)) return;
+    const { error } = await supabase.rpc('remove_group_member', { target_chat_id: groupEditChat.id, target_user_id: member.id });
+    if (error) setActionError(error.message);
+    else {
+      setGroupEditChat({ ...groupEditChat, participants: groupEditChat.participants?.filter((entry) => entry.id !== member.id) });
+      await fetchChatsAndProfiles();
+    }
+  };
+
   const uploadMediaMessage = async (file: File, messageType: MessageType, durationSeconds?: number) => {
-    if (!activeChat || !user) return;
+    if (!activeChat || !user || activeChat.is_blocked) return;
     if (file.size > MAX_MEDIA_BYTES) throw new Error('Media must be smaller than 15 MB.');
 
     setIsUploading(true);
@@ -298,11 +528,14 @@ export default function ChatPage() {
         media_mime_type: file.type,
         media_size: file.size,
         duration_seconds: durationSeconds || null,
+        is_read: !!activeChat.is_self,
       });
       if (messageError) {
         await supabase.storage.from('chat-media').remove([path]);
         throw messageError;
       }
+
+      void notifyChatParticipants(activeChat.id);
 
       await fetchMessages(activeChat.id);
       await fetchChatsAndProfiles();
@@ -388,6 +621,164 @@ export default function ChatPage() {
     else if (activeChat) await fetchMessages(activeChat.id);
   };
 
+  const openChat = async (chat: Chat) => {
+    if (chat.is_locked && !unlockedChatIds.has(chat.id)) {
+      const pin = window.prompt(`Enter the PIN for ${chat.name}`);
+      if (pin === null) return;
+      const { data: verified, error } = await supabase.rpc('verify_chat_lock_pin', { target_chat_id: chat.id, pin_value: pin });
+      if (error || !verified) {
+        setActionError(error?.message || 'Incorrect chat PIN.');
+        return;
+      }
+      setUnlockedChatIds((current) => new Set(current).add(chat.id));
+    }
+    if (chat.encryption_enabled && !chatSecrets.has(chat.id)) {
+      const secret = window.prompt(`Enter the shared encryption secret for ${chat.name}`);
+      if (!secret) return;
+      setChatSecrets((current) => new Map(current).set(chat.id, secret));
+    }
+    setActiveChat(chat);
+    setShowChatMenu(false);
+    setMessageActionId(null);
+    setMobileView('chat');
+  };
+
+  const openSelfChat = async () => {
+    if (!user || !profile) return;
+    setActionError(null);
+    const { data: chatId, error } = await supabase.rpc('create_self_chat');
+    if (error || !chatId) {
+      setActionError(error?.message || 'Your personal chat could not be opened.');
+      return;
+    }
+    const existing = chats.find((chat) => chat.id === chatId);
+    const selfConversation = existing || {
+      id: chatId,
+      name: `${profile.display_name} (You)`,
+      is_group: false,
+      is_self: true,
+      created_at: new Date().toISOString(),
+      participants: [profile],
+      unread_count: 0,
+    };
+    await openChat(selfConversation);
+    await fetchChatsAndProfiles();
+  };
+
+  const toggleFavorite = async () => {
+    if (!activeChat) return;
+    const params = { target_chat_id: activeChat.id, favorite_value: !activeChat.is_favorite, locked_value: null };
+    const { error } = await supabase.rpc('set_chat_preferences', params);
+    if (error) setActionError(error.message);
+    else {
+      setShowChatMenu(false);
+      await fetchChatsAndProfiles();
+    }
+  };
+
+  const toggleChatLock = async () => {
+    if (!activeChat) return;
+    const pin = window.prompt(activeChat.is_locked ? 'Enter the current PIN to unlock this chat' : 'Create a 4–8 digit PIN for this chat');
+    if (pin === null) return;
+    const rpc = activeChat.is_locked ? 'clear_chat_lock' : 'set_chat_lock_pin';
+    const { error } = await supabase.rpc(rpc, { target_chat_id: activeChat.id, pin_value: pin });
+    if (error) setActionError(error.message);
+    else {
+      setUnlockedChatIds((current) => {
+        const next = new Set(current);
+        if (activeChat.is_locked) next.delete(activeChat.id); else next.add(activeChat.id);
+        return next;
+      });
+      if (activeChat.is_locked && lockedCount === 1) setChatFilter('all');
+      setShowChatMenu(false);
+      await fetchChatsAndProfiles();
+    }
+  };
+
+  const toggleArchive = async () => {
+    if (!activeChat) return;
+    const { error } = await supabase.rpc('set_chat_archived', { target_chat_id: activeChat.id, archived_value: !activeChat.is_archived });
+    if (error) setActionError(error.message);
+    else {
+      setShowChatMenu(false);
+      setActiveChat(null);
+      await fetchChatsAndProfiles();
+    }
+  };
+
+  const enableSharedSecretEncryption = async () => {
+    if (!activeChat || activeChat.encryption_enabled) return;
+    const secret = window.prompt('Create a strong shared secret (at least 12 characters). Share it with participants outside 3SChat. It is never uploaded.');
+    if (!secret || secret.length < 12) {
+      if (secret !== null) setActionError('The shared secret must contain at least 12 characters.');
+      return;
+    }
+    const { data: salt, error } = await supabase.rpc('enable_chat_encryption', { target_chat_id: activeChat.id });
+    if (error || !salt) setActionError(error?.message || 'Encryption could not be enabled.');
+    else {
+      setChatSecrets((current) => new Map(current).set(activeChat.id, secret));
+      setActiveChat({ ...activeChat, encryption_enabled: true, encryption_salt: salt });
+      setShowChatMenu(false);
+      await fetchChatsAndProfiles();
+    }
+  };
+
+  const toggleBlockActiveUser = async () => {
+    const targetUser = activeChat?.participants?.[0];
+    if (!activeChat || activeChat.is_self || !targetUser) return;
+    if (!window.confirm(`${activeChat.is_blocked ? 'Unblock' : 'Block'} ${targetUser.display_name}?`)) return;
+    const { error } = await supabase.rpc('toggle_block_user', { target_user_id: targetUser.id });
+    if (error) setActionError(error.message);
+    else {
+      setShowChatMenu(false);
+      await fetchChatsAndProfiles();
+    }
+  };
+
+  const runMessageAction = async (message: Message, action: 'pin' | 'edit' | 'delete' | 'report') => {
+    setMessageActionId(null);
+    if (!activeChat) return;
+    try {
+      if (action === 'pin') {
+        const { error } = await supabase.rpc('toggle_message_pin', { target_message_id: message.id });
+        if (error) throw error;
+      } else if (action === 'edit') {
+        const nextContent = window.prompt('Update your message', message.content || '');
+        if (nextContent === null || nextContent.trim() === message.content?.trim()) return;
+        const { error } = await supabase.rpc('edit_message', { target_message_id: message.id, new_content: nextContent });
+        if (error) throw error;
+      } else if (action === 'delete') {
+        if (!window.confirm('Delete this message? This cannot be undone.')) return;
+        if (message.media_path) {
+          const { error: mediaError } = await supabase.storage.from('chat-media').remove([message.media_path]);
+          if (mediaError) throw mediaError;
+        }
+        const { error } = await supabase.rpc('delete_message', { target_message_id: message.id });
+        if (error) throw error;
+      } else {
+        const reason = window.prompt('Why are you reporting this message?');
+        if (reason === null) return;
+        const { error } = await supabase.rpc('submit_report', { target_message_id: message.id, report_reason: reason });
+        if (error) throw error;
+        window.alert('Report submitted to the moderation team.');
+      }
+      await fetchMessages(activeChat.id);
+      await fetchChatsAndProfiles();
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : 'The message could not be updated.');
+    }
+  };
+
+  const beginLongPress = (messageId: string) => {
+    if (longPressTimerRef.current) clearTimeout(longPressTimerRef.current);
+    longPressTimerRef.current = setTimeout(() => setMessageActionId(messageId), 550);
+  };
+
+  const cancelLongPress = () => {
+    if (longPressTimerRef.current) clearTimeout(longPressTimerRef.current);
+    longPressTimerRef.current = null;
+  };
+
   useEffect(() => () => {
     if (mediaRecorderRef.current?.state === 'recording') {
       mediaRecorderRef.current.ondataavailable = null;
@@ -395,6 +786,8 @@ export default function ChatPage() {
       mediaRecorderRef.current.stop();
     }
     mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
+    if (longPressTimerRef.current) clearTimeout(longPressTimerRef.current);
+    if (typingTimerRef.current) clearTimeout(typingTimerRef.current);
   }, []);
 
   // 7. Update profile action
@@ -411,33 +804,38 @@ export default function ChatPage() {
   };
 
   // Filters
-  const filteredChats = chats.filter((c) =>
-    c.name.toLowerCase().includes(searchQuery.toLowerCase())
-  );
+  const totalUnread = unreadTotal(chats);
+  const lockedCount = chats.filter((chat) => chat.is_locked).length;
+  const archivedCount = chats.filter((chat) => chat.is_archived).length;
+  const selfChat = chats.find((chat) => chat.is_self);
+  const latestPinnedMessage = [...messages].reverse().find((message) => message.is_pinned && !message.deleted_at);
+  const activeTypingNames = activeChat?.participants?.filter((entry) => typingUserIds.has(entry.id)).map((entry) => entry.display_name) || [];
+  const activeChatOnline = activeChat?.participants?.some((entry) => onlineUserIds.has(entry.id)) || false;
+  const filteredChats = filterChats(chats, chatFilter, searchQuery);
 
   const filteredProfiles = profiles.filter((p) =>
     p.display_name?.toLowerCase().includes(newChatSearch.toLowerCase()) ||
     p.phone_number?.includes(newChatSearch)
   );
 
-  const filterPills = [
-    { label: 'All', active: true },
-    { label: 'Unread 1', active: false },
-    { label: 'Favorites', active: false },
-    { label: 'Groups', active: false }
+  const filterPills: Array<{ label: string; value: ChatFilterValue }> = [
+    { label: 'All', value: 'all' },
+    { label: totalUnread ? `Unread ${totalUnread}` : 'Unread', value: 'unread' },
+    { label: 'Favorites', value: 'favorites' },
+    { label: 'Groups', value: 'groups' },
   ];
 
   const bottomNavItems = [
-    { label: 'Chats', icon: MessageCircle, active: true, badge: 1 },
+    { label: 'Chats', icon: MessageCircle, active: true, badge: totalUnread || undefined },
     { label: 'Updates', icon: CircleDashed, active: false },
     { label: 'Communities', icon: UsersRound, active: false },
     { label: 'Calls', icon: Phone, active: false }
   ];
 
   const railItems = [
-    { label: 'Chats', icon: MessageCircle, active: true, badge: 1 },
+    { label: 'Chats', icon: MessageCircle, active: true, badge: totalUnread || undefined },
     { label: 'Updates', icon: CircleDashed, active: false },
-    { label: 'Calls', icon: Phone, active: false, dot: true },
+    { label: 'Calls', icon: Phone, active: false },
     { label: 'Communities', icon: UsersRound, active: false }
   ];
 
@@ -445,7 +843,17 @@ export default function ChatPage() {
     setEditName(profile?.display_name || '');
     setEditStatus(profile?.status || '');
     setEditAvatar(profile?.avatar_url || '');
+    setEditEmail(user?.email || '');
+    setEditPhone(profile?.phone_number || '');
     setShowSettings(true);
+  };
+
+  const handleAccountChange = async (kind: 'email' | 'phone') => {
+    setIsUpdatingProfile(true);
+    const result = kind === 'email' ? await changeEmail(editEmail) : await changePhone(editPhone);
+    setIsUpdatingProfile(false);
+    if (result.success) window.alert(kind === 'email' ? 'Check both your old and new email inboxes to confirm the change.' : 'Phone number updated.');
+    else setActionError(result.error || 'Account update failed.');
   };
 
   const formatChatTime = (date?: string) =>
@@ -475,6 +883,7 @@ export default function ChatPage() {
                   key={item.label}
                   type="button"
                   title={item.label}
+                  onClick={() => item.label !== 'Chats' && setUtilityPanel(item.label.toLowerCase() as 'updates' | 'communities' | 'calls')}
                   className={`relative grid h-11 w-11 place-items-center rounded-full transition ${
                     item.active ? 'bg-[#2f3734] text-white' : 'text-[#aebac1] hover:bg-[#2a302e] hover:text-white'
                   }`}
@@ -485,9 +894,6 @@ export default function ChatPage() {
                       {item.badge}
                     </span>
                   )}
-                  {item.dot && (
-                    <span className="absolute right-1.5 top-1.5 h-2.5 w-2.5 rounded-full bg-gradient-to-r from-blue-500 to-red-500 ring-2 ring-[#202624]" />
-                  )}
                 </button>
               );
             })}
@@ -497,9 +903,11 @@ export default function ChatPage() {
             <button
               type="button"
               title="Archived"
-              className="grid h-11 w-11 place-items-center rounded-full text-[#aebac1] transition hover:bg-[#2a302e] hover:text-white"
+              onClick={() => setChatFilter((current) => current === 'archived' ? 'all' : 'archived')}
+              className={`relative grid h-11 w-11 place-items-center rounded-full transition hover:bg-[#2a302e] hover:text-white ${chatFilter === 'archived' ? 'bg-[#2f3734] text-white' : 'text-[#aebac1]'}`}
             >
               <Archive className="h-5 w-5" />
+              {!!archivedCount && <span className="absolute -right-0.5 -top-1 grid h-5 min-w-5 place-items-center rounded-full bg-blue-500 px-1 text-[10px] text-white">{archivedCount}</span>}
             </button>
             <button
               type="button"
@@ -509,6 +917,11 @@ export default function ChatPage() {
             >
               <Settings className="h-5 w-5" />
             </button>
+            {profile?.role !== 'user' && (
+              <button type="button" title={profile?.role === 'admin' ? 'Admin dashboard' : 'Moderation dashboard'} onClick={() => router.push('/admin')} className="grid h-11 w-11 place-items-center rounded-full text-blue-300 transition hover:bg-blue-500/10 hover:text-white">
+                <ShieldCheck className="h-5 w-5" />
+              </button>
+            )}
             <button
               type="button"
               title="Sign out"
@@ -581,8 +994,9 @@ export default function ChatPage() {
                 <button
                   key={pill.label}
                   type="button"
+                  onClick={() => setChatFilter(pill.value)}
                   className={`h-8 shrink-0 rounded-full border px-3 text-sm font-semibold transition ${
-                    pill.active
+                    chatFilter === pill.value
                       ? 'border-blue-500/30 bg-gradient-to-r from-blue-600/35 to-red-600/30 text-white'
                       : 'border-white/10 bg-transparent text-[#aebac1] hover:border-white/20 hover:text-white'
                   }`}
@@ -600,15 +1014,18 @@ export default function ChatPage() {
             </div>
           </div>
 
-          <button type="button" className="mx-4 mb-2 flex h-12 items-center gap-8 rounded-lg px-5 text-left text-[#aebac1] transition hover:bg-[#202c2f] cursor-pointer">
-            <LockKeyhole className="h-5 w-5" />
-            <span className="text-base font-medium">Locked chats</span>
-          </button>
+          {lockedCount > 0 && (
+            <button type="button" onClick={() => setChatFilter((current) => current === 'locked' ? 'all' : 'locked')} className={`mx-4 mb-2 flex h-12 items-center gap-8 rounded-lg px-5 text-left transition cursor-pointer ${chatFilter === 'locked' ? 'bg-[#202c2f] text-white' : 'text-[#aebac1] hover:bg-[#202c2f]'}`}>
+              <LockKeyhole className="h-5 w-5" />
+              <span className="flex-1 text-base font-medium">Locked chats</span>
+              <span className="rounded-full bg-white/10 px-2 py-0.5 text-xs">{lockedCount}</span>
+            </button>
+          )}
 
           <button
             type="button"
-            onClick={openProfileSettings}
-            className="mx-3 mb-2 flex items-center gap-3 rounded-lg bg-[#2a2f2d] p-3 text-left transition hover:bg-[#333937] cursor-pointer"
+            onClick={() => void openSelfChat()}
+            className={`mx-3 mb-2 flex items-center gap-3 rounded-lg p-3 text-left transition cursor-pointer ${activeChat?.is_self ? 'bg-[#2a2f2d]' : 'hover:bg-[#202c2f]'}`}
           >
             <img
               src={profile?.avatar_url || 'https://api.dicebear.com/7.x/bottts/svg?seed=fallback'}
@@ -620,15 +1037,15 @@ export default function ChatPage() {
                 <p className="truncate text-base font-semibold text-white">
                   {profile?.display_name || 'Me'} (You)
                 </p>
-                <span className="text-xs text-[#aebac1]">10:10 PM</span>
+                <span className="text-xs text-[#aebac1]">{formatChatTime(selfChat?.updated_at || selfChat?.created_at)}</span>
               </div>
               <p className="mt-0.5 flex min-w-0 items-center gap-1.5 truncate text-sm text-[#aebac1]">
                 <CheckCheck className="h-4 w-4 shrink-0 text-blue-400" />
-                <ImageIcon className="h-3.5 w-3.5 shrink-0" />
-                <span className="truncate">{profile?.status || 'Edit your profile'}</span>
+                {selfChat?.last_message && <ImageIcon className="h-3.5 w-3.5 shrink-0" />}
+                <span className="truncate">{selfChat?.last_message || 'Message yourself'}</span>
               </p>
             </div>
-            <Pin className="h-4 w-4 shrink-0 text-[#aebac1]" />
+            {selfChat?.is_favorite && <Star className="h-4 w-4 shrink-0 fill-amber-400 text-amber-400" />}
           </button>
 
           {/* Chat List Items */}
@@ -636,13 +1053,8 @@ export default function ChatPage() {
             {filteredChats.length === 0 ? (
               <div className="p-8 text-center flex flex-col items-center justify-center space-y-3">
                 <MessageSquare className="w-10 h-10 text-gray-600" />
-                <p className="text-gray-500 text-sm">No active chats found.</p>
-                <button
-                  onClick={() => setShowNewChatModal(true)}
-                  className="px-4 py-2 bg-brand-gradient rounded-full text-sm font-semibold text-white cursor-pointer"
-                >
-                  Start New Chat
-                </button>
+                <p className="text-gray-500 text-sm">No {chatFilter === 'all' ? 'active' : chatFilter} chats found.</p>
+                {chatFilter === 'all' && <button onClick={() => setShowNewChatModal(true)} className="px-4 py-2 bg-brand-gradient rounded-full text-sm font-semibold text-white cursor-pointer">Start New Chat</button>}
               </div>
             ) : (
               filteredChats.map((c) => {
@@ -652,10 +1064,7 @@ export default function ChatPage() {
                 return (
                   <div
                     key={c.id}
-                    onClick={() => {
-                      setActiveChat(c);
-                      setMobileView('chat');
-                    }}
+                    onClick={() => void openChat(c)}
                     className={`group flex cursor-pointer select-none items-center gap-3 rounded-lg px-3 py-3 transition duration-200 ${
                       isActive 
                         ? 'bg-[#2a2f2d]' 
@@ -684,13 +1093,15 @@ export default function ChatPage() {
                         <p className="flex min-w-0 items-center gap-1.5 truncate text-sm text-[#aebac1]">
                           <CheckCheck className="h-4 w-4 shrink-0 text-gray-500" />
                           <span className="truncate">
-                            {targetProfile?.status || 'You pinned a message'}
+                            {c.last_message || targetProfile?.status || 'No messages yet'}
                           </span>
                         </p>
                         
-                        {isActive && (
-                          <Pin className="h-4 w-4 shrink-0 text-gray-500" />
-                        )}
+                        <div className="flex shrink-0 items-center gap-1.5">
+                          {!!c.unread_count && <span className="grid h-5 min-w-5 place-items-center rounded-full bg-gradient-to-r from-blue-600 to-red-600 px-1 text-[11px] font-bold text-white">{c.unread_count}</span>}
+                          {c.is_favorite && <Star className="h-4 w-4 fill-amber-400 text-amber-400" />}
+                          {c.is_locked && <LockKeyhole className="h-4 w-4 text-[#aebac1]" />}
+                        </div>
                       </div>
                     </div>
                   </div>
@@ -714,6 +1125,7 @@ export default function ChatPage() {
                 <button
                   key={item.label}
                   type="button"
+                  onClick={() => item.label !== 'Chats' && setUtilityPanel(item.label.toLowerCase() as 'updates' | 'communities' | 'calls')}
                   className={`relative flex flex-col items-center gap-1 text-xs font-bold ${
                     item.active ? 'text-white' : 'text-gray-400'
                   }`}
@@ -762,12 +1174,14 @@ export default function ChatPage() {
                       {activeChat.name}
                     </h3>
                     <p className="truncate text-xs text-[#aebac1]">
-                      {activeChat.participants?.[0]?.status || 'Message yourself'}
+                      {activeTypingNames.length ? `${activeTypingNames.join(', ')} typing…` : activeChat.is_self ? 'Personal notes' : activeChatOnline ? 'Online' : activeChat.participants?.[0]?.status || `${activeChat.participants?.length || 0} members`}
                     </p>
                   </div>
                 </div>
 
-                <div className="flex items-center gap-4 text-[#aebac1]">
+                <div className="relative flex items-center gap-4 text-[#aebac1]">
+                  {!activeChat.is_self && <button type="button" title="Audio call" onClick={() => void callManager.startCall(activeChat.id, 'audio')} className="rounded-full p-2 transition hover:bg-[#2a302e] hover:text-white"><Phone className="h-5 w-5" /></button>}
+                  {!activeChat.is_self && <button type="button" title="Video call" onClick={() => void callManager.startCall(activeChat.id, 'video')} className="rounded-full p-2 transition hover:bg-[#2a302e] hover:text-white"><Video className="h-5 w-5" /></button>}
                   <button
                     type="button"
                     title="Search"
@@ -778,107 +1192,53 @@ export default function ChatPage() {
                   <button
                     type="button"
                     title="More"
+                    onClick={() => setShowChatMenu((visible) => !visible)}
                     className="rounded-full p-2 transition hover:bg-[#2a302e] hover:text-white cursor-pointer"
                   >
                     <MoreVertical className="h-5 w-5" />
                   </button>
+                  {showChatMenu && (
+                    <div className="absolute right-0 top-11 z-40 w-52 overflow-hidden rounded-xl border border-white/10 bg-[#202624] py-1 text-sm text-white shadow-2xl">
+                      <button type="button" onClick={() => void toggleFavorite()} className="flex w-full items-center gap-3 px-4 py-3 text-left hover:bg-white/10">
+                        <Star className={`h-4 w-4 ${activeChat.is_favorite ? 'fill-amber-400 text-amber-400' : ''}`} />
+                        {activeChat.is_favorite ? 'Remove favorite' : 'Add to favorites'}
+                      </button>
+                      <button type="button" onClick={() => void toggleChatLock()} className="flex w-full items-center gap-3 px-4 py-3 text-left hover:bg-white/10">
+                        {activeChat.is_locked ? <Unlock className="h-4 w-4" /> : <LockKeyhole className="h-4 w-4" />}
+                        {activeChat.is_locked ? 'Unlock chat' : 'Lock chat'}
+                      </button>
+                      <button type="button" onClick={() => void toggleArchive()} className="flex w-full items-center gap-3 px-4 py-3 text-left hover:bg-white/10">
+                        <Archive className="h-4 w-4" /> {activeChat.is_archived ? 'Unarchive chat' : 'Archive chat'}
+                      </button>
+                      {activeChat.is_group && activeChat.member_role !== 'member' && (
+                        <button type="button" onClick={() => openGroupEditor(activeChat)} className="flex w-full items-center gap-3 px-4 py-3 text-left hover:bg-white/10">
+                          <UsersRound className="h-4 w-4" /> Manage group
+                        </button>
+                      )}
+                      {!activeChat.encryption_enabled ? (
+                        <button type="button" onClick={() => void enableSharedSecretEncryption()} className="flex w-full items-center gap-3 px-4 py-3 text-left text-emerald-300 hover:bg-emerald-500/10"><ShieldCheck className="h-4 w-4" />Enable encrypted mode</button>
+                      ) : <div className="px-4 py-2 text-[10px] text-emerald-300">AES-GCM shared-secret mode</div>}
+                      {!activeChat.is_self && (
+                        <button type="button" onClick={() => void toggleBlockActiveUser()} className="flex w-full items-center gap-3 px-4 py-3 text-left text-red-300 hover:bg-red-500/10">
+                          <Ban className="h-4 w-4" /> {activeChat.is_blocked ? 'Unblock user' : 'Block user'}
+                        </button>
+                      )}
+                    </div>
+                  )}
                 </div>
               </div>
 
-              <div className="flex h-12 items-center gap-6 border-b border-black/30 bg-[#1f2725]/90 px-8 text-sm text-[#c8d0d4]">
-                <Pin className="h-4 w-4 shrink-0 text-[#aebac1]" />
-                <span className="truncate">
-                  {activeChat.participants?.[0]?.status || 'Private conversation'}
-                </span>
-              </div>
+              {latestPinnedMessage && (
+                <button type="button" onClick={() => document.getElementById(`message-${latestPinnedMessage.id}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' })} className="flex h-12 items-center gap-6 border-b border-black/30 bg-[#1f2725]/90 px-8 text-left text-sm text-[#c8d0d4] hover:bg-[#26302d]">
+                  <Pin className="h-4 w-4 shrink-0 text-blue-400" />
+                  <span className="truncate">{latestPinnedMessage.content || (latestPinnedMessage.message_type === 'image' ? 'Pinned image' : 'Pinned voice message')}</span>
+                </button>
+              )}
 
               {/* Chat messages viewport */}
               <div className="flex-1 overflow-y-auto p-4 space-y-4 chat-bg-pattern">
-                <div className="flex justify-center">
-                  <div className="rounded-lg bg-[#202c2f]/90 px-3 py-1.5 text-xs text-[#c8d0d4] shadow">
-                    You pinned a message
-                  </div>
-                </div>
-
                 <AnimatePresence initial={false}>
-                  {messages.map((m) => {
-                    const isOutgoing = m.sender_id === user.id;
-                    const messageTime = new Date(m.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-
-                    return (
-                      <motion.div
-                        key={m.id}
-                        initial={{ opacity: 0, y: 10 }}
-                        animate={{ opacity: 1, y: 0 }}
-                        exit={{ opacity: 0, scale: 0.95 }}
-                        transition={{ duration: 0.2 }}
-                        className={`flex ${isOutgoing ? 'justify-end' : 'justify-start'}`}
-                      >
-                        <div
-                          className={`group/message relative max-w-[78%] rounded-2xl px-4 py-2.5 shadow-md ${
-                            isOutgoing 
-                              ? 'bubble-outgoing text-white' 
-                              : 'bubble-incoming text-gray-200'
-                          }`}
-                        >
-                          {m.message_type === 'image' && m.media_url && (
-                            <a href={m.media_url} target="_blank" rel="noreferrer" className="mb-2 block overflow-hidden rounded-xl">
-                              <img src={m.media_url} alt={m.content || 'Shared image'} className="max-h-80 w-full object-contain" loading="lazy" />
-                            </a>
-                          )}
-                          {m.message_type === 'voice' && m.media_url && (
-                            <div className="mb-1 flex min-w-[220px] items-center gap-2">
-                              <Mic className="h-5 w-5 shrink-0 text-blue-300" />
-                              <audio controls preload="metadata" src={m.media_url} className="h-9 min-w-0 flex-1" />
-                              {m.duration_seconds && <span className="text-[10px] text-white/60">{m.duration_seconds}s</span>}
-                            </div>
-                          )}
-                          {m.content && m.message_type !== 'voice' && (
-                            <p className="whitespace-pre-wrap break-words text-sm leading-relaxed select-text">{m.content}</p>
-                          )}
-                          {m.message_type !== 'text' && !m.media_url && (
-                            <p className="text-xs text-amber-200">Media link expired. Refresh the conversation.</p>
-                          )}
-                          <div className="flex items-center justify-end space-x-1 mt-1">
-                            <span className="text-[9px] text-white/50 block select-none">
-                              {messageTime}
-                            </span>
-                            {isOutgoing && (
-                              <CheckCheck className={`h-3.5 w-3.5 shrink-0 ${m.is_read ? 'text-blue-300' : 'text-white/40'}`} />
-                            )}
-                          </div>
-                          <button
-                            type="button"
-                            onClick={() => setReactingTo((current) => current === m.id ? null : m.id)}
-                            title="React to message"
-                            className={`absolute -top-3 ${isOutgoing ? '-left-8' : '-right-8'} rounded-full bg-[#26302d] p-1.5 text-[#aebac1] opacity-0 shadow transition hover:text-white group-hover/message:opacity-100`}
-                          >
-                            <Smile className="h-4 w-4" />
-                          </button>
-                          {reactingTo === m.id && (
-                            <div className={`absolute -top-11 z-30 flex gap-1 rounded-full border border-white/10 bg-[#202624] p-1.5 shadow-xl ${isOutgoing ? 'right-0' : 'left-0'}`}>
-                              {REACTION_EMOJIS.map((emoji) => (
-                                <button key={emoji} type="button" onClick={() => void toggleReaction(m, emoji)} className="rounded-full p-1 text-lg transition hover:scale-125 hover:bg-white/10">{emoji}</button>
-                              ))}
-                            </div>
-                          )}
-                          {!!m.reactions?.length && (
-                            <div className={`absolute -bottom-4 flex gap-1 ${isOutgoing ? 'right-2' : 'left-2'}`}>
-                              {Array.from(new Set(m.reactions.map((reaction) => reaction.emoji))).map((emoji) => {
-                                const count = m.reactions?.filter((reaction) => reaction.emoji === emoji).length || 0;
-                                const mine = m.reactions?.some((reaction) => reaction.emoji === emoji && reaction.user_id === user.id);
-                                return (
-                                  <button key={emoji} type="button" onClick={() => void toggleReaction(m, emoji)} className={`rounded-full border px-1.5 py-0.5 text-xs shadow ${mine ? 'border-blue-400/60 bg-blue-500/20' : 'border-white/10 bg-[#202624]'}`}>
-                                    {emoji}{count > 1 ? ` ${count}` : ''}
-                                  </button>
-                                );
-                              })}
-                            </div>
-                          )}
-                        </div>
-                      </motion.div>
-                    );
-                  })}
+                  {messages.map((message) => <MessageBubble key={message.id} message={message} chat={activeChat} currentUserId={user.id} actionOpen={messageActionId === message.id} reactionPickerOpen={reactingTo === message.id} onBeginLongPress={() => beginLongPress(message.id)} onCancelLongPress={cancelLongPress} onOpenActions={() => setMessageActionId(message.id)} onAction={(action) => void runMessageAction(message, action)} onToggleReactionPicker={() => setReactingTo((current) => current === message.id ? null : message.id)} onReaction={(emoji) => void toggleReaction(message, emoji)} />)}
                 </AnimatePresence>
                 
                 <div ref={messagesEndRef} />
@@ -890,6 +1250,9 @@ export default function ChatPage() {
                   <button type="button" onClick={() => setActionError(null)} aria-label="Dismiss error"><X className="h-4 w-4" /></button>
                 </div>
               )}
+              {activeChat.is_blocked && (
+                <div className="border-t border-amber-500/20 bg-amber-950/40 px-4 py-2 text-center text-xs text-amber-200">Unblock this user from the chat menu before sending messages.</div>
+              )}
               {/* Chat composer */}
               <form onSubmit={handleSendMessage} className="relative flex min-h-[62px] items-center gap-2 bg-[#1f2725] px-3 py-2">
                 <input ref={fileInputRef} type="file" accept="image/jpeg,image/png,image/webp,image/gif" onChange={handleFileSelected} className="hidden" />
@@ -897,7 +1260,7 @@ export default function ChatPage() {
                   type="button"
                   title="Send an image"
                   onClick={() => fileInputRef.current?.click()}
-                  disabled={isUploading || isRecording}
+                  disabled={isUploading || isRecording || activeChat.is_blocked}
                   className="rounded-full p-2.5 text-[#aebac1] transition hover:bg-[#2a302e] hover:text-white cursor-pointer"
                 >
                   {isUploading ? <Loader2 className="h-6 w-6 animate-spin" /> : <Paperclip className="h-6 w-6" />}
@@ -906,7 +1269,7 @@ export default function ChatPage() {
                   type="button"
                   title="Insert emoji"
                   onClick={() => setShowEmojiPicker((visible) => !visible)}
-                  disabled={isRecording}
+                  disabled={isRecording || activeChat.is_blocked}
                   className="rounded-full p-2.5 text-[#aebac1] transition hover:bg-[#2a302e] hover:text-white cursor-pointer"
                 >
                   <Smile className="h-6 w-6" />
@@ -923,8 +1286,8 @@ export default function ChatPage() {
                   type="text"
                   placeholder={isRecording ? 'Recording voice message…' : 'Type a message'}
                   value={inputText}
-                  onChange={(e) => setInputText(e.target.value)}
-                  disabled={isRecording || isUploading}
+                  onChange={(e) => handleMessageInput(e.target.value)}
+                  disabled={isRecording || isUploading || activeChat.is_blocked}
                   maxLength={5000}
                   className="min-w-0 flex-1 rounded-xl border border-transparent bg-[#2a302e] px-4 py-3 text-sm text-white placeholder:text-[#aebac1] focus:border-blue-500/50 focus:outline-none"
                 />
@@ -932,7 +1295,7 @@ export default function ChatPage() {
                 <button
                   type={inputText.trim() ? 'submit' : 'button'}
                   onClick={inputText.trim() ? undefined : (isRecording ? stopRecording : () => void startRecording())}
-                  disabled={isUploading}
+                  disabled={isUploading || activeChat.is_blocked}
                   title={inputText.trim() ? 'Send message' : isRecording ? 'Stop and send recording' : 'Record voice message'}
                   className={`rounded-full p-2.5 transition cursor-pointer ${
                     inputText.trim()
@@ -1024,6 +1387,10 @@ export default function ChatPage() {
                   />
                 </div>
 
+                <button type="button" onClick={() => { setShowNewChatModal(false); openGroupEditor(); }} className="mb-4 flex w-full items-center justify-center gap-2 rounded-xl border border-blue-500/30 bg-blue-500/10 py-2.5 text-sm font-semibold text-blue-200 hover:bg-blue-500/20">
+                  <UsersRound className="h-4 w-4" /> Create group conversation
+                </button>
+
                 <div className="max-h-[300px] overflow-y-auto divide-y divide-white/5 pr-1">
                   {filteredProfiles.length === 0 ? (
                     <div className="p-8 text-center">
@@ -1063,6 +1430,24 @@ export default function ChatPage() {
             </div>
           )}
         </AnimatePresence>
+
+        <AnimatePresence>
+          {showGroupModal && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm">
+              <motion.form onSubmit={saveGroup} initial={{ opacity: 0, scale: 0.96 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.96 }} className="glass-container w-full max-w-lg rounded-3xl p-6 shadow-2xl">
+                <div className="mb-5 flex items-center justify-between"><h3 className="flex items-center gap-2 text-lg font-bold"><UsersRound className="h-5 w-5 text-blue-400" />{groupEditChat ? 'Manage group' : 'Create group'}</h3><button type="button" onClick={() => setShowGroupModal(false)}><X className="h-5 w-5 text-gray-400" /></button></div>
+                <label className="mb-4 block"><span className="mb-2 block text-xs font-semibold uppercase text-gray-400">Group name</span><input value={groupName} onChange={(event) => setGroupName(event.target.value)} required minLength={2} maxLength={100} className="glass-input w-full rounded-xl px-4 py-3" /></label>
+                {groupEditChat?.participants?.length ? <div className="mb-4"><p className="mb-2 text-xs font-semibold uppercase text-gray-400">Current members</p><div className="flex flex-wrap gap-2">{groupEditChat.participants.map((member) => <span key={member.id} className="flex items-center gap-1 rounded-full bg-white/10 px-3 py-1 text-xs">{member.display_name}<button type="button" onClick={() => void removeGroupMember(member)} className="text-red-300"><X className="h-3 w-3" /></button></span>)}</div></div> : null}
+                <p className="mb-2 text-xs font-semibold uppercase text-gray-400">{groupEditChat ? 'Add members' : 'Select members'}</p>
+                <div className="mb-5 max-h-64 space-y-1 overflow-y-auto rounded-xl border border-white/10 p-2">{profiles.filter((entry) => !groupEditChat?.participants?.some((member) => member.id === entry.id)).map((entry) => <label key={entry.id} className="flex cursor-pointer items-center gap-3 rounded-lg p-2 hover:bg-white/5"><input type="checkbox" checked={groupMemberIds.has(entry.id)} onChange={() => setGroupMemberIds((current) => { const next = new Set(current); if (next.has(entry.id)) next.delete(entry.id); else next.add(entry.id); return next; })} /><img src={entry.avatar_url || `https://api.dicebear.com/7.x/bottts/svg?seed=${entry.id}`} alt="" className="h-8 w-8 rounded-full" /><span className="text-sm">{entry.display_name}</span></label>)}</div>
+                <button disabled={isUploading} className="flex w-full items-center justify-center rounded-xl bg-brand-gradient py-3 font-semibold text-white disabled:opacity-50">{isUploading ? <Loader2 className="h-5 w-5 animate-spin" /> : groupEditChat ? 'Save group' : 'Create group'}</button>
+              </motion.form>
+            </div>
+          )}
+        </AnimatePresence>
+
+        <CallOverlay call={callManager.call} incomingCall={callManager.incomingCall} localStream={callManager.localStream} remoteStream={callManager.remoteStream} callerName={chats.find((chat) => chat.id === (callManager.incomingCall || callManager.call)?.chat_id)?.name || '3SChat user'} onAccept={() => void callManager.acceptCall()} onDecline={() => void callManager.declineCall()} onEnd={() => void callManager.endCall()} />
+        {utilityPanel && <UtilityPanel mode={utilityPanel} userId={user.id} onClose={() => setUtilityPanel(null)} />}
 
         {/* ========================================================= */}
         {/* PROFILE / SETTINGS EDIT MODAL                             */}
@@ -1145,6 +1530,14 @@ export default function ChatPage() {
                       onChange={(e) => setEditStatus(e.target.value)}
                       className="w-full rounded-xl border border-white/10 bg-[#202c2f] px-4 py-3 text-sm text-white outline-none transition focus:border-blue-500/70"
                     />
+                  </div>
+
+                  <div className="space-y-3 border-t border-white/10 pt-4">
+                    <p className="text-xs font-semibold uppercase text-[#aebac1]">Account recovery and identity</p>
+                    <div className="flex gap-2"><input type="email" value={editEmail} onChange={(event) => setEditEmail(event.target.value)} className="min-w-0 flex-1 rounded-xl border border-white/10 bg-[#202c2f] px-3 py-2.5 text-sm" /><button type="button" onClick={() => void handleAccountChange('email')} className="rounded-xl border border-blue-500/30 px-3 text-xs text-blue-300">Change email</button></div>
+                    <div className="flex gap-2"><input type="tel" value={editPhone} onChange={(event) => setEditPhone(event.target.value)} className="min-w-0 flex-1 rounded-xl border border-white/10 bg-[#202c2f] px-3 py-2.5 text-sm" /><button type="button" onClick={() => void handleAccountChange('phone')} className="rounded-xl border border-blue-500/30 px-3 text-xs text-blue-300">Change phone</button></div>
+                    <p className="text-[10px] leading-relaxed text-gray-500">Email changes require confirmation. If you lose access, use the normal email-code login flow with your registered email.</p>
+                    <PushNotificationButton />
                   </div>
 
                   <div className="flex gap-3 pt-2">

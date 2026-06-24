@@ -25,6 +25,8 @@ interface AuthContextType {
   verifyOTP: (phoneNumber: string, email: string, code: string) => Promise<AuthResult>;
   logout: () => Promise<void>;
   updateProfile: (displayName: string, status: string, avatarUrl?: string) => Promise<AuthResult>;
+  changeEmail: (email: string) => Promise<AuthResult>;
+  changePhone: (phone: string) => Promise<AuthResult>;
   resetKickout: () => void;
 }
 
@@ -48,7 +50,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const loadProfile = useCallback(async (userId: string) => {
     const { data, error } = await supabase
       .from('profiles')
-      .select('id, phone_number, display_name, avatar_url, status, last_seen')
+      .select('id, phone_number, display_name, avatar_url, status, last_seen, role, account_status, suspension_reason, suspended_at')
       .eq('id', userId)
       .single();
 
@@ -172,7 +174,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
       const { data: accountProfile, error: profileError } = await supabase
         .from('profiles')
-        .select('id, phone_number, display_name, avatar_url, status, last_seen')
+        .select('id, phone_number, display_name, avatar_url, status, last_seen, role, account_status, suspension_reason, suspended_at')
         .eq('id', data.session.user.id)
         .single();
 
@@ -218,11 +220,25 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       .from('profiles')
       .update(updates)
       .eq('id', user.id)
-      .select('id, phone_number, display_name, avatar_url, status, last_seen')
+      .select('id, phone_number, display_name, avatar_url, status, last_seen, role, account_status, suspension_reason, suspended_at')
       .single();
 
     if (error) return { success: false, error: error.message };
     setProfile(data as Profile);
+    return { success: true };
+  };
+
+  const changeEmail = async (email: string): Promise<AuthResult> => {
+    const { error } = await supabase.auth.updateUser({ email: email.trim().toLowerCase() });
+    return error ? { success: false, error: error.message } : { success: true };
+  };
+
+  const changePhone = async (phone: string): Promise<AuthResult> => {
+    if (!user) return { success: false, error: 'You are not signed in.' };
+    const normalized = normalizePhone(phone);
+    const { error } = await supabase.rpc('change_phone_number', { new_phone: normalized });
+    if (error) return { success: false, error: error.message };
+    setProfile((current) => current ? { ...current, phone_number: normalized } : current);
     return { success: true };
   };
 
@@ -236,6 +252,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       verifyOTP,
       logout,
       updateProfile,
+      changeEmail,
+      changePhone,
       resetKickout: () => setSessionKickout(false),
     }}>
       {children}
